@@ -2429,7 +2429,7 @@ def _keepalive_loop():
     Replit aggressively sleeps published apps — UptimeRobot hitting /health
     keeps the process alive but doesn't trigger data fetches. This loop
     ensures refresh_dashboard_data() runs at least every 3 minutes."""
-    _time.sleep(30)  # Wait for initial startup
+    _time.sleep(60)  # Wait for initial startup and first thread stagger
     while True:
         try:
             if _time.time() - _dashboard_state["last_updated"] > 120:
@@ -2443,11 +2443,22 @@ def start_background_threads():
     global _threads_started
     if _threads_started: return
     _threads_started = True
-    threading.Thread(target=_gdelt_background_loop, daemon=True).start()
-    threading.Thread(target=_gtrends_background_loop, daemon=True).start()
-    threading.Thread(target=_cloudflare_background_loop, daemon=True).start()
-    threading.Thread(target=_keepalive_loop, daemon=True).start()
-    print("Background threads started: GDELT + Google Trends + Cloudflare Radar + Keepalive")
+    # Stagger thread launches to avoid OOM from simultaneous memory spikes
+    def _staggered_start():
+        _time.sleep(5)
+        threading.Thread(target=_cloudflare_background_loop, daemon=True).start()
+        print("Background thread started: Cloudflare Radar")
+        _time.sleep(30)
+        threading.Thread(target=_gdelt_background_loop, daemon=True).start()
+        print("Background thread started: GDELT BigQuery")
+        _time.sleep(30)
+        threading.Thread(target=_gtrends_background_loop, daemon=True).start()
+        print("Background thread started: Google Trends")
+        _time.sleep(10)
+        threading.Thread(target=_keepalive_loop, daemon=True).start()
+        print("Background thread started: Keepalive")
+    threading.Thread(target=_staggered_start, daemon=True).start()
+    print("Background threads starting (staggered)...")
 
 start_background_threads()
 
