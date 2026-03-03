@@ -52,7 +52,6 @@ app = Flask(__name__)
 
 _dashboard_state = {"html": None, "last_updated": 0, "updating": False}
 _gtrends_state = {"regional": {}, "last_updated": 0, "fetching": False}
-_last_contract_snapshot_time = 0
 
 # ============================================================
 # SUPABASE
@@ -81,7 +80,6 @@ def get_supabase():
 WEIGHTS = {"polymarket": 0.375, "markets": 0.375, "gt_panic": 0.25}
 GLOBAL_REGIONAL_WEIGHT = 0.85
 GLOBAL_PM_WEIGHT = 0.15
-PM_MATURITY_THRESHOLD = 50
 PM_STD_FLOOR = 0.01
 LOOKBACK_DAYS = 120
 
@@ -208,6 +206,7 @@ STRONG_KEYWORDS = [
     "visits china", "visits north korea", "rubio visits",
     "total internet blackout", "evacuates beirut", "evacuates jerusalem",
     "evacuates baghdad", "us x iran diplomatic", "iran diplomatic meeting",
+    "reopen embassy", "reopens embassy", "reopen its embassy",
 ]
 
 CONTEXT_KEYWORDS = [
@@ -235,6 +234,11 @@ MEME_TERMS = [
     "map winner", "map handicap", "games total", "bo3", "bo5",
     "game changers", "vct ", "esl ", "blast ", "major winner",
     "overwatch", "call of duty", "fortnite", "apex legends",
+    "set 1 winner", "total sets", "set 1 games", "match o/u",
+    "o/u ", "handicap", "moneyline", "set winner",
+    "total games", "match total", "spread",
+    "atp ", "wta ", "itf ", "challenger ", "kigali",
+    " vs. ", " vs ",
 ]
 
 DE_ESCALATION_KEYWORDS = [
@@ -247,6 +251,7 @@ DE_ESCALATION_KEYWORDS = [
     "rubio visits china", "iran diplomatic meeting", "us x iran diplomatic",
     "conflict ends", "end of military operations", "ends military operations",
     "announces end of", "operations end by",
+    "reopen embassy", "reopens embassy", "reopen its embassy",
 ]
 
 DE_ESCALATION_NEGATORS = [
@@ -270,6 +275,9 @@ EXCLUDE_KEYWORDS = [
     "strike nigeria next", "strike venezuela next", "strike syria next",
     "strike lebanon next", "strike north korea next", "strike colombia next",
     "us strike next", "will the us strike next",
+    "senator enter", "senator visit", "any u.s. senator enter",
+    "trump say", "say during", "medal of honor",
+    "house passes", "senate passes", "war powers resolution",
 ]
 
 EXCLUDE_PATTERNS = [
@@ -513,7 +521,7 @@ def save_score_snapshot(composite, pm, mkt, acled, gdelt, pm_stats, acled_stats,
         recent = db.table("daily_scores").select("recorded_at").order("recorded_at", desc=True).limit(1).execute()
         if recent.data:
             last_time = dateparser.parse(recent.data[0]["recorded_at"])
-            if (datetime.now(timezone.utc) - last_time).total_seconds() < 900: return  # 15-min cadence (temporarily accelerated from 30-min for crisis period)
+            if (datetime.now(timezone.utc) - last_time).total_seconds() < 900: return
         row = {
             "composite_score": composite, "polymarket_score": pm, "markets_score": mkt,
             "acled_score": acled, "gdelt_score": gdelt,
@@ -530,29 +538,6 @@ def save_score_snapshot(composite, pm, mkt, acled, gdelt, pm_stats, acled_stats,
         print(f"Saved score snapshot: {composite}")
     except Exception as e:
         print(f"Supabase save error: {e}")
-
-
-def save_contract_snapshots(geo_markets):
-    global _last_contract_snapshot_time
-    if not geo_markets: return
-    now = _time.time()
-    if now - _last_contract_snapshot_time < 180: return  # 3-min cadence (temporarily accelerated from 10-min for crisis period)
-    db = get_supabase()
-    if not db: return
-    try:
-        now_iso = datetime.now(timezone.utc).isoformat()
-        rows = [{
-            "recorded_at": now_iso, "contract_slug": m.get("slug", ""),
-            "question": m.get("question", ""), "yes_price": m.get("yes_price", 0),
-            "risk_price": m.get("risk_price", 0), "volume": m.get("volume", 0),
-            "is_deescalation": m.get("is_deescalation", False), "region": m.get("region", "global"),
-        } for m in geo_markets]
-        for i in range(0, len(rows), 50):
-            db.table("contract_snapshots").insert(rows[i:i + 50]).execute()
-        _last_contract_snapshot_time = now
-        print(f"Saved {len(rows)} contract snapshots (10-min cadence)")
-    except Exception as e:
-        print(f"Contract snapshot save error: {e}")
 
 
 def save_regional_scores(regional_composites, pm_regional, mkt_regional):
@@ -594,10 +579,21 @@ def fetch_score_history(days=30):
     if not db: return []
     try:
         since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-        r = db.table("daily_scores").select(
-            "recorded_at,composite_score,polymarket_score,markets_score,acled_score,gdelt_score"
-        ).gte("recorded_at", since).order("recorded_at", desc=False).execute()
-        return r.data or []
+        all_data = []
+        batch_size = 1000
+        offset = 0
+        while True:
+            r = db.table("daily_scores").select(
+                "recorded_at,composite_score,polymarket_score,markets_score,acled_score,gdelt_score"
+            ).gte("recorded_at", since).order("recorded_at", desc=False).range(offset, offset + batch_size - 1).execute()
+            if not r.data:
+                break
+            all_data.extend(r.data)
+            if len(r.data) < batch_size:
+                break
+            offset += batch_size
+        print(f"Global history: {len(all_data)} rows fetched")
+        return all_data
     except Exception as e:
         print(f"Supabase fetch error: {e}")
         return []
@@ -623,12 +619,23 @@ def fetch_regional_score_history(days=30):
     if not db: return {}
     try:
         since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-        r = db.table("regional_scores").select(
-            "recorded_at,region,composite_score,polymarket_score,markets_score,gdelt_score,gtrends_score,gt_panic_score,gt_global_score,cloudflare_score"
-        ).gte("recorded_at", since).order("recorded_at", desc=False).execute()
-        if not r.data: return {}
+        all_data = []
+        batch_size = 1000
+        offset = 0
+        while True:
+            r = db.table("regional_scores").select(
+                "recorded_at,region,composite_score,polymarket_score,markets_score,gdelt_score,gtrends_score,gt_panic_score,gt_global_score,cloudflare_score"
+            ).gte("recorded_at", since).order("recorded_at", desc=False).range(offset, offset + batch_size - 1).execute()
+            if not r.data:
+                break
+            all_data.extend(r.data)
+            if len(r.data) < batch_size:
+                break
+            offset += batch_size
+        if not all_data: return {}
+        print(f"Regional history: {len(all_data)} rows fetched, latest={all_data[-1]['recorded_at'][:16]}")
         history = {}
-        for row in r.data:
+        for row in all_data:
             reg = row.get("region", "")
             if reg not in history: history[reg] = []
             history[reg].append({
@@ -647,6 +654,8 @@ def fetch_regional_score_history(days=30):
 # ============================================================
 # POLYMARKET — FETCH & FILTER
 # ============================================================
+
+CLOB_BASE_URL = "https://clob.polymarket.com"
 
 def classify_contract_region(st):
     if any(gk in st for gk in GLOBAL_KEYWORDS): return "global"
@@ -677,10 +686,14 @@ def fetch_polymarket_events():
 
 def filter_geopolitical_markets(events):
     geo = []
+    seen_questions = set()  # Deduplicate identical contracts across events
     for ev in events:
         title, slug = ev.get("title", ""), ev.get("slug", "")
         for mkt in ev.get("markets", []):
             q = mkt.get("question", "")
+            if q in seen_questions:
+                continue
+            seen_questions.add(q)
             st = f"{title} {q} {slug}".lower()
             if mkt.get("closed") or mkt.get("resolved"):
                 continue
@@ -707,70 +720,147 @@ def filter_geopolitical_markets(events):
             is_de = any(k in st for k in DE_ESCALATION_KEYWORDS)
             if is_de and any(n in st for n in DE_ESCALATION_NEGATORS): is_de = False
             rp = (1.0 - yp) if is_de else yp
+            clob_token_id = None
+            try:
+                clob_ids = mkt.get("clobTokenIds", "[]")
+                clob_list = json.loads(clob_ids) if isinstance(clob_ids, str) else (clob_ids or [])
+                if clob_list:
+                    clob_token_id = clob_list[0]
+            except: pass
             geo.append({
                 "question": q or title, "yes_price": yp, "risk_price": rp,
                 "probability_pct": round(yp * 100, 1), "risk_pct": round(rp * 100, 1),
                 "volume": vol, "slug": mkt.get("marketSlug", slug),
                 "is_deescalation": is_de, "region": classify_contract_region(st),
+                "clob_token_id": clob_token_id,
             })
     geo.sort(key=lambda x: x["volume"], reverse=True)
     return geo
 
 
 # ============================================================
-# POLYMARKET — PER-CONTRACT NORMALISATION
+# POLYMARKET — CLOB API PRICE HISTORY
 # ============================================================
 
-def fetch_contract_baselines():
-    db = get_supabase()
-    if not db: return {}
+def fetch_clob_price_history(token_id, interval="1w", fidelity=60):
     try:
-        since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-        all_rows, page_size, offset = [], 1000, 0
-        while True:
-            r = db.table("contract_snapshots").select("contract_slug,question,risk_price,recorded_at").gte("recorded_at", since).order("recorded_at", desc=False).range(offset, offset + page_size - 1).execute()
-            if not r.data: break
-            all_rows.extend(r.data)
-            if len(r.data) < page_size: break
-            offset += page_size
-        if not all_rows:
-            print("Contract baselines: no data"); return {}
-        print(f"Contract baselines: fetched {len(all_rows)} total rows")
-        by_question = defaultdict(list)
-        for row in all_rows:
-            q, rp, ra, slug = row.get("question", ""), row.get("risk_price"), row.get("recorded_at", ""), row.get("contract_slug", "")
-            if q and rp is not None: by_question[q].append({"rp": float(rp), "at": ra, "slug": slug})
-        now = datetime.now(timezone.utc)
-        t_24h, t_48h = now - timedelta(hours=24), now - timedelta(hours=48)
-        baselines, immature_details = {}, []
-        for q, records in by_question.items():
-            n = len(records)
-            prices = [r["rp"] for r in records]
-            m, s = np.mean(prices), np.std(prices)
-            slug = records[0]["slug"] if records else ""
-            recent_48h = [r for r in records if r["at"] and dateparser.parse(r["at"]) > t_48h]
-            spark_prices = [r["rp"] for r in recent_48h] if recent_48h else prices[-12:]
-            if len(spark_prices) > 12:
-                step = max(1, len(spark_prices) // 11)
-                spark_prices = spark_prices[::step][:11] + [spark_prices[-1]]
-            price_24h = None
-            for r in records:
-                if r["at"]:
-                    try:
-                        rt = dateparser.parse(r["at"])
-                        if rt <= t_24h: price_24h = r["rp"]
-                    except: pass
-            entry = {"mean": round(m, 4), "std": round(s, 4), "count": n, "slug": slug, "sparkline": spark_prices, "price_24h_ago": price_24h}
-            if n < PM_MATURITY_THRESHOLD:
-                immature_details.append(f"{q[:40]}({n})"); entry["mature"] = False
-            else: entry["mature"] = True
-            baselines[q] = entry
-        mature_count = sum(1 for v in baselines.values() if v["mature"])
-        print(f"Contract baselines: {mature_count} mature out of {len(baselines)} total")
-        return baselines
+        r = requests.get(f"{CLOB_BASE_URL}/prices-history",
+                         params={"market": token_id, "interval": interval, "fidelity": fidelity},
+                         timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            return data.get("history", [])
+        else:
+            print(f"CLOB price history error {r.status_code} for {token_id[:20]}...")
+            return []
     except Exception as e:
-        print(f"Contract baseline fetch error: {e}"); return {}
+        print(f"CLOB price history fetch error: {e}")
+        return []
 
+
+def fetch_clob_baselines(geo_markets):
+    if not geo_markets:
+        return {}
+    baselines = {}
+    mature_count = 0
+    new_count = 0
+    t0 = _time.time()
+    now_ts = _time.time()
+    t_24h = now_ts - 86400
+    t_48h = now_ts - 172800
+
+    # Parallel fetch helper
+    def _fetch_one(m, fidelity=60):
+        token_id = m.get("clob_token_id")
+        if not token_id:
+            return m.get("question", ""), None, fidelity
+        history = fetch_clob_price_history(token_id, interval="1w", fidelity=fidelity)
+        return m.get("question", ""), history, fidelity
+
+    # First pass: all contracts at hourly fidelity, 4 parallel workers with throttling
+    immature_retry = []
+    batch_size = 20
+    for batch_start in range(0, len(geo_markets), batch_size):
+        batch = geo_markets[batch_start:batch_start + batch_size]
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {executor.submit(_fetch_one, m, 60): m for m in batch}
+            for future in as_completed(futures):
+                m = futures[future]
+                q, history, fid = future.result()
+                if not history or len(history) < 12:
+                    immature_retry.append((m, q, history))
+                    continue
+                bl = _build_baseline_from_history(history, m, now_ts, t_24h, t_48h)
+                baselines[q] = bl
+                mature_count += 1
+                if bl.get("is_new"): new_count += 1
+        if batch_start + batch_size < len(geo_markets):
+            _time.sleep(0.3)
+
+    # Second pass: retry immature contracts at 30-min fidelity
+    if immature_retry:
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {executor.submit(_fetch_one, m, 30): (m, q, prev) for m, q, prev in immature_retry}
+            for future in as_completed(futures):
+                m, q, prev = futures[future]
+                _, history, fid = future.result()
+                if not history or len(history) < 12:
+                    first_ts = history[0]["t"] if history else (prev[0]["t"] if prev else None)
+                    baselines[q] = {
+                        "mean": 0.5, "std": 0.0, "count": len(history) if history else (len(prev) if prev else 0),
+                        "slug": m.get("slug", ""), "sparkline": [],
+                        "price_24h_ago": None, "mature": False,
+                        "is_new": True, "first_traded": first_ts,
+                    }
+                    continue
+                bl = _build_baseline_from_history(history, m, now_ts, t_24h, t_48h)
+                baselines[q] = bl
+                mature_count += 1
+                if bl.get("is_new"): new_count += 1
+
+    elapsed = _time.time() - t0
+    print(f"CLOB baselines: {mature_count} mature ({new_count} new <24h), {len(immature_retry)} retried at 30-min ({elapsed:.1f}s)")
+    return baselines
+
+
+def _build_baseline_from_history(history, market, now_ts, t_24h, t_48h):
+    """Build a baseline dict from CLOB price history data points."""
+    is_de = market.get("is_deescalation", False)
+    prices = [(1.0 - h["p"]) if is_de else h["p"] for h in history]
+    timestamps = [h["t"] for h in history]
+
+    mean_price = np.mean(prices)
+    std_price = np.std(prices)
+    first_traded = timestamps[0] if timestamps else None
+    is_new = first_traded is not None and (now_ts - first_traded) < 86400
+
+    # Find 24h-ago price
+    price_24h = None
+    for j in range(len(timestamps) - 1, -1, -1):
+        if timestamps[j] <= t_24h:
+            price_24h = prices[j]
+            break
+
+    # Build sparkline from last 48h
+    spark_history = [h for h in history if h["t"] >= t_48h]
+    if not spark_history:
+        spark_history = history[-24:]
+    spark_prices = [(1.0 - h["p"]) if is_de else h["p"] for h in spark_history]
+    if len(spark_prices) > 12:
+        step = max(1, len(spark_prices) // 11)
+        spark_prices = spark_prices[::step][:11] + [spark_prices[-1]]
+
+    return {
+        "mean": round(mean_price, 4),
+        "std": round(std_price, 4),
+        "count": len(history),
+        "slug": market.get("slug", ""),
+        "sparkline": spark_prices,
+        "price_24h_ago": price_24h,
+        "mature": True,
+        "is_new": is_new,
+        "first_traded": first_traded,
+    }
 
 def calculate_polymarket_score_normalised(contracts, baselines):
     if not contracts:
@@ -789,14 +879,16 @@ def calculate_polymarket_score_normalised(contracts, baselines):
     hp = max(contracts, key=lambda x: x["yes_price"]) if contracts else None
     if not mature:
         return 50.0, {"num_contracts": len(contracts), "total_volume": tv, "highest_prob": hp, "avg_risk_pct": 50.0, "threat_count": tc, "deesc_count": dc, "mature_count": 0, "immature_count": len(contracts), "method": "z-score", "agg_z": 0.0, "contract_zscores": []}
-    total_vol = sum(m["contract"]["volume"] for m in mature)
-    agg_z = sum(m["z"] * m["contract"]["volume"] for m in mature) / total_vol if total_vol > 0 else np.mean([m["z"] for m in mature])
+    import math
+    vol_weights = [math.sqrt(max(m["contract"]["volume"], 1)) for m in mature]
+    total_w = sum(vol_weights)
+    agg_z = sum(m["z"] * w for m, w in zip(mature, vol_weights)) / total_w if total_w > 0 else np.mean([m["z"] for m in mature])
     score = z_to_centred_score(agg_z)
-    ar = sum(m["contract"]["risk_price"] * m["contract"]["volume"] for m in mature) / total_vol if total_vol > 0 else np.mean([m["contract"]["risk_price"] for m in mature])
+    ar = sum(m["contract"]["risk_price"] * w for m, w in zip(mature, vol_weights)) / total_w if total_w > 0 else np.mean([m["contract"]["risk_price"] for m in mature])
     contract_zscores = []
-    total_abs_contrib = sum(abs(m["z"] * m["contract"]["volume"]) for m in mature)
-    for m in mature:
-        contrib_pct = (abs(m["z"] * m["contract"]["volume"]) / total_abs_contrib * 100) if total_abs_contrib > 0 else 0
+    total_abs_contrib = sum(abs(m["z"] * w) for m, w in zip(mature, vol_weights))
+    for m, w in zip(mature, vol_weights):
+        contrib_pct = (abs(m["z"] * w) / total_abs_contrib * 100) if total_abs_contrib > 0 else 0
         contract_zscores.append({"q": m["contract"]["question"][:60], "z": m["z"], "rp": round(m["contract"]["risk_price"], 4), "mean": m["baseline"]["mean"], "std": m["baseline"]["std"], "n": m["baseline"]["count"], "contrib_pct": round(contrib_pct, 1), "contrib_dir": "up" if m["z"] > 0 else "down" if m["z"] < 0 else "neutral"})
     print(f"PM normalised: {len(mature)} mature, {len(immature_slugs)} immature, agg_z={agg_z:.3f}, score={score}")
     return round(score, 1), {"num_contracts": len(contracts), "total_volume": tv, "highest_prob": hp, "avg_risk_pct": round(ar * 100, 1), "threat_count": tc, "deesc_count": dc, "mature_count": len(mature), "immature_count": len(immature_slugs), "method": "z-score", "agg_z": round(agg_z, 3), "contract_zscores": contract_zscores}
@@ -827,23 +919,39 @@ def fetch_market_data():
     results = {}
     end = datetime.now()
     start = end - timedelta(days=LOOKBACK_DAYS)
+    success, failed = [], []
     for ticker, info in MARKET_TICKERS.items():
         base = {"name": info["name"], "type": info["type"], "region": info.get("region", "global"), "inverted": info.get("inverted", False)}
         try:
-            hist = yf.Ticker(ticker).history(start=start, end=end)
+            try:
+                hist = yf.Ticker(ticker).history(start=start, end=end)
+            except Exception as dst_err:
+                if "Cannot infer dst" in str(dst_err):
+                    # DST ambiguity — retry with shorter lookback to avoid the boundary
+                    shorter_start = end - timedelta(days=60)
+                    hist = yf.Ticker(ticker).history(start=shorter_start, end=end)
+                else:
+                    raise
             if hist.empty or len(hist) < 10:
-                results[ticker] = {**base, "error": "Insufficient data"}; continue
+                results[ticker] = {**base, "error": "Insufficient data"}
+                failed.append(f"{ticker}({len(hist) if not hist.empty else 0})")
+                continue
             hist["pct_change"] = hist["Close"].pct_change() * 100
             ch = hist["pct_change"].dropna()
             if len(ch) < 10:
-                results[ticker] = {**base, "error": "Insufficient data"}; continue
+                results[ticker] = {**base, "error": "Insufficient data"}
+                failed.append(f"{ticker}(ch={len(ch)})")
+                continue
             cp, lc = round(hist["Close"].iloc[-1], 2), round(ch.iloc[-1], 2)
             mc, sc = ch.mean(), ch.std()
             z = round((lc - mc) / sc, 2) if sc > 0 else 0.0
             score_z = -z if info.get("inverted", False) else z
             results[ticker] = {**base, "current_price": cp, "daily_change_pct": lc, "z_score": score_z, "score_z": score_z, "normalised_score": z_to_centred_score(score_z), "history_days": len(ch), "sparkline": ch.tail(7).tolist()}
+            success.append(ticker)
         except Exception as e:
             results[ticker] = {**base, "error": str(e)}
+            failed.append(f"{ticker}(ERR:{str(e)[:40]})")
+    print(f"yfinance: {len(success)}/{len(MARKET_TICKERS)} tickers OK" + (f" | FAILED: {', '.join(failed)}" if failed else ""))
     return results
 
 
@@ -1242,20 +1350,13 @@ def _cloudflare_background_loop():
 # ============================================================
 
 def calculate_regional_composite(pm_score, mkt_score, gt_panic_score=None, gdelt_score=None, gt_global_score=None, cloudflare_score=None):
-    """Composite from Stage 2+3 signals only. Stage 1 (Cloudflare) and Stage 4
-    (GDELT, GT Global) excluded from composite — shown as separate layers.
-    Weights: Polymarket 37.5%, Financial Markets 37.5%, GT Panic 25%."""
-    weighted = []
-    if pm_score is not None:
-        weighted.append((pm_score, 0.375))
-    if mkt_score is not None:
-        weighted.append((mkt_score, 0.375))
-    if gt_panic_score is not None:
-        weighted.append((gt_panic_score, 0.25))
-    if not weighted:
-        return 50.0
-    total_w = sum(w for _, w in weighted)
-    return round(sum(s * w / total_w for s, w in weighted), 1)
+    """Composite from Stage 2+3 signals. When a signal hasn't fetched yet
+    (None), use 50.0 (neutral) rather than excluding it — this prevents
+    weight renormalisation from inflating the composite."""
+    ps = pm_score if pm_score is not None else 50.0
+    ms = mkt_score if mkt_score is not None else 50.0
+    gp = gt_panic_score if gt_panic_score is not None else 50.0
+    return round(ps * 0.375 + ms * 0.375 + gp * 0.25, 1)
 
 def calculate_regional_composites(pm_reg, mkt_reg, gdelt_reg=None, gtrends_reg=None, cloudflare_reg=None):
     gdelt_reg, gtrends_reg, cloudflare_reg = gdelt_reg or {}, gtrends_reg or {}, cloudflare_reg or {}
@@ -1308,818 +1409,370 @@ DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Geopolitical Risk Dashboard</title>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
-    <style>
-        *{margin:0;padding:0;box-sizing:border-box}
-        body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#08080d;color:#f0f0f0;min-height:100vh;border-top:3px solid {{ risk_colour }}}
-        .ctr{max-width:900px;margin:0 auto;padding:0 16px}
-
-        /* Ticker Strip */
-        .ticker{background:#06060a;border-bottom:1px solid #1a1a2e;padding:6px 20px;overflow:hidden;white-space:nowrap}
-        .ticker-inner{display:flex;gap:32px;font-size:0.65em;color:#888;animation:tickerScroll 30s linear infinite}
-        .ticker:hover .ticker-inner{animation-play-state:paused}
-        @keyframes tickerScroll{0%{transform:translateX(0)}100%{transform:translateX(-50%)}}
-        .ticker-alert{color:#f87171}
-        .ticker-move{color:#ef4444}
-
-        /* Header */
-        header{text-align:center;padding:20px 0 8px}
-        h1{font-size:1.3em;font-weight:700;letter-spacing:3px;color:#fff}
-        .sub{color:#888;font-size:0.75em;margin-top:4px}
-        .live-counter{color:#555;font-size:0.6em;margin-top:2px}
-
-        /* Tabs */
-        .tabs{display:flex;gap:4px;margin-bottom:16px;background:#111118;border-radius:12px;padding:4px;border:1px solid #1e1e2e}
-        .tab{flex:1;padding:8px 6px;text-align:center;border-radius:8px;cursor:pointer;font-size:0.7em;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:#666;transition:all 0.2s}
-        .tab:hover{color:#ccc;background:rgba(255,255,255,0.04)}
-        .tab.active{background:#1a1a2e;color:#fff}
-        .tab-score{display:block;font-size:1.6em;font-weight:800;margin-top:2px}
-        .view{display:none}.view.active{display:block}
-
-        /* Score Card */
-        .sc{background:linear-gradient(145deg,#111118,#0d0d14);border:2px solid #333;border-radius:16px;padding:28px 24px;text-align:center;margin-bottom:16px;position:relative;overflow:hidden}
-        .sc-glow{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:300px;height:300px;border-radius:50%;filter:blur(80px);opacity:0.15;pointer-events:none}
-        .sc-num{font-size:4.5em;font-weight:800;line-height:1;position:relative;text-shadow:0 0 30px rgba(255,255,255,0.15)}
-        .sc-label{font-size:1em;font-weight:700;letter-spacing:3px;margin-top:4px;position:relative}
-        .sc-conv{font-size:0.8em;font-weight:600;letter-spacing:1px;margin-top:6px;position:relative}
-        .sc-conv span{font-weight:400;opacity:0.7}
-        .sc-sub{color:#888;font-size:0.7em;margin-top:6px;position:relative}
-
-        /* Gradient Bar */
-        .bar{width:100%;height:20px;position:relative;margin-top:12px}
-        .bar-track{position:absolute;top:50%;left:0;right:0;height:5px;border-radius:3px;background:linear-gradient(to right,#059669 0%,#34d399 22%,#b0b0b0 50%,#eab308 65%,#f97316 80%,#ef4444 90%,#dc2626 100%);transform:translateY(-50%);opacity:0.75}
-        .bar-mid{position:absolute;top:50%;left:50%;width:1px;height:14px;background:#444;transform:translate(-50%,-50%);z-index:1}
-        .bar-dot{position:absolute;top:50%;width:14px;height:14px;border-radius:50%;transform:translate(-50%,-50%);z-index:2;border:2px solid rgba(255,255,255,0.25);transition:left 0.8s ease}
-
-        /* Stage Indicators */
-        .si{display:flex;gap:3px;align-items:center;justify-content:center;margin-top:8px}
-        .si-dot{display:flex;align-items:center;gap:4px;padding:3px 8px;border-radius:4px;font-size:0.55em;font-weight:700;letter-spacing:1px;color:#888}
-        .si-dot .dot{width:6px;height:6px;border-radius:50%}
-        .si-quiet{background:#111118;border:1px solid #1e1e2e}
-        .si-quiet .dot{background:#555}
-        .si-active{background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.25)}
-        .si-active .dot{background:#fbbf24;box-shadow:0 0 6px #fbbf24}
-        .si-alert{background:rgba(248,113,113,0.08);border:1px solid rgba(248,113,113,0.25)}
-        .si-alert .dot{background:#f87171;box-shadow:0 0 6px #f87171}
-        .si-alert .dot{animation:pulse 2s ease-in-out infinite}
-        @keyframes pulse{0%,100%{opacity:1;box-shadow:0 0 6px currentColor}50%{opacity:0.6;box-shadow:0 0 12px currentColor}}
-
-        /* Region Cards */
-        .rgrid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:16px}
-        @media(max-width:600px){.rgrid{grid-template-columns:1fr}}
-        .rcard{background:#111118;border:2px solid #333;border-radius:12px;padding:14px;text-align:center;cursor:pointer;transition:all 0.2s}
-        .rcard:hover{border-color:#555;transform:translateY(-2px)}
-        .rcard-name{font-size:0.6em;text-transform:uppercase;letter-spacing:1.5px;color:#eee;font-weight:600}
-        .rcard-score{font-size:2em;font-weight:800}
-        .rcard-conv{font-size:0.6em;font-weight:600;margin-top:2px}
-        .rcard-wt{font-size:0.55em;color:#555;margin-top:4px}
-
-        /* Stage Sections */
-        .stage{margin-bottom:12px;background:#0a0a12;border:1px solid #1a1a2e;border-radius:12px;overflow:hidden;transition:border-color 0.3s}
-        .stage-head{padding:12px 16px;cursor:pointer;display:flex;justify-content:space-between;align-items:center}
-        .stage-icon{font-size:1.1em;margin-right:10px}
-        .stage-title{font-size:0.65em;font-weight:700;color:#eee;letter-spacing:1.5px}
-        .stage-desc{font-size:0.6em;color:#666;margin-top:2px}
-        .stage-status{font-size:0.6em;font-weight:700;letter-spacing:1px;padding:3px 10px;border-radius:4px}
-        .stage-body{padding:0 16px 14px;display:none}
-        .stage.open .stage-body{display:block}
-        .stage-arrow{color:#555;font-size:0.8em;transition:transform 0.2s}
-        .stage.open .stage-arrow{transform:rotate(90deg)}
-        .stage-ew{font-size:0.5em;padding:2px 6px;border-radius:3px;background:rgba(249,115,22,0.12);color:#f97316;font-weight:700;letter-spacing:0.5px;margin-left:8px}
-
-        /* Signal Cards */
-        .sig{background:#0c0c14;border:1px solid #1e1e2e;border-radius:10px;padding:14px 16px;margin-bottom:8px;transition:border-color 0.3s}
-        .sig-head{display:flex;justify-content:space-between;align-items:flex-start}
-        .sig-name{font-size:0.75em;font-weight:700;color:#eee;letter-spacing:1.5px;text-transform:uppercase}
-        .sig-src{font-size:0.55em;color:#888;margin-top:2px}
-        .sig-score{font-size:1.8em;font-weight:800;line-height:1}
-        .sig-detail{font-size:0.7em;color:#aaa;margin-top:6px}
-        .sig-alert{font-size:0.7em;color:#f87171;margin-top:3px}
-
-        /* Detail Dropdowns */
-        .dd{background:#08080d;border:1px solid #1a1a2e;border-radius:10px;margin-top:8px;overflow:hidden}
-        .dd-toggle{font-size:0.7em;color:#aaa;padding:10px 14px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;font-weight:600;letter-spacing:1px;text-transform:uppercase}
-        .dd-toggle:hover{color:#eee}
-        .dd-body{padding:0 14px 12px;display:none}
-        .dd.open .dd-body{display:block}
-        .dd-arrow{color:#555;font-size:0.7em;transition:transform 0.2s}
-        .dd.open .dd-arrow{transform:rotate(90deg)}
-
-        /* Ticker/Contract Rows */
-        .trow{display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-bottom:1px solid #111118}
-        .trow:last-child{border-bottom:none}
-        .trow-name{font-size:0.85em;color:#fff;font-weight:500}
-        .trow-sub{font-size:0.65em;color:#888}
-        .trow-stats{display:flex;gap:14px;align-items:center}
-        .trow-immature{opacity:0.45}
-        .trow-spark{min-width:60px;text-align:center}
-        .trow-val{font-size:0.85em;font-weight:700;min-width:55px;text-align:right}
-        .trow-change{font-size:0.75em;font-weight:600;min-width:50px;text-align:right}
-        .trow-z{font-size:0.7em;color:#888;min-width:50px;text-align:right}
-        .trow-wt{font-size:0.6em;min-width:40px;text-align:right}
-        .badge{font-size:0.55em;padding:2px 6px;border-radius:4px;font-weight:600;letter-spacing:0.5px;margin-left:6px}
-        .badge-threat{background:#3a1a1a;color:#ef4444}
-        .badge-deesc{background:#1a2a1a;color:#22c55e}
-        .badge-mature{background:#1a1a2e;color:#818cf8}
-        .badge-immature{background:#1a1a1a;color:#555}
-        .col-header{font-size:0.6em;color:#666;text-transform:uppercase;letter-spacing:1px}
-
-        /* Graph */
-        .graph-ctrl{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:10px;padding:0 4px}
-        .graph-tgl{display:flex;align-items:center;gap:5px;font-size:0.7em;color:#aaa;cursor:pointer;user-select:none}
-        .graph-tgl input{cursor:pointer}
-        .tgl-sw{display:inline-block;width:12px;height:3px;border-radius:2px}
-        .tf-btn{background:#1a1a2e;border:1px solid #333;color:#888;padding:4px 12px;border-radius:6px;font-size:0.65em;cursor:pointer;font-weight:600;letter-spacing:0.5px;transition:all 0.2s}
-        .tf-btn:hover{color:#ccc;border-color:#555}
-        .tf-btn.active{background:#2a2a4e;color:#eee;border-color:#555}
-
-        /* Supplemental */
-        .supp{background:#0a0a12;border:1px solid #1a1a2e;border-radius:12px;margin-bottom:12px;overflow:hidden}
-        .supp-head{padding:12px 16px;cursor:pointer;display:flex;justify-content:space-between;align-items:center}
-        .supp.open .dd-body{display:block}
-        .supp-badge{font-size:0.5em;padding:2px 6px;border-radius:3px;background:#1a1a2e;color:#666;font-weight:700}
-
-        /* Methodology link */
-        .meth-link{display:block;text-align:center;padding:12px;color:#555;font-size:0.7em;text-decoration:none;letter-spacing:1px}
-        .meth-link:hover{color:#888}
-
-        footer{text-align:center;padding:16px 0;color:#444;font-size:0.65em}
-        .err{background:#1a0a0a;border:1px solid #3a1a1a;border-radius:12px;padding:20px;text-align:center;color:#ef4444}
-    </style>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Geopolitical Risk Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#08080d;color:#f0f0f0;min-height:100vh;border-top:3px solid {{ risk_colour }}}
+.ctr{max-width:900px;margin:0 auto;padding:0 16px}
+.ticker{background:#06060a;border-bottom:1px solid #1a1a2e;padding:6px 20px;overflow:hidden;white-space:nowrap}
+.ticker-inner{display:flex;gap:32px;font-size:.65em;color:#888;animation:tickerScroll 30s linear infinite}
+.ticker:hover .ticker-inner{animation-play-state:paused}
+@keyframes tickerScroll{0%{transform:translateX(0)}100%{transform:translateX(-50%)}}
+.ticker-alert{color:#f87171}.ticker-move{color:#ef4444}
+header{text-align:center;padding:20px 0 8px}
+h1{font-size:1.3em;font-weight:700;letter-spacing:3px;color:#fff}
+.sub{color:#888;font-size:.75em;margin-top:4px}
+.live-counter{color:#555;font-size:.6em;margin-top:2px}
+.tabs{display:flex;gap:4px;margin-bottom:16px;background:#111118;border-radius:12px;padding:4px;border:1px solid #1e1e2e}
+.tab{flex:1;padding:8px 6px;text-align:center;border-radius:8px;cursor:pointer;font-size:.7em;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:#666;transition:all .2s}
+.tab:hover{color:#ccc;background:rgba(255,255,255,.04)}.tab.active{background:#1a1a2e;color:#fff}
+.tab-score{display:block;font-size:1.6em;font-weight:800;margin-top:2px}
+.view{display:none}.view.active{display:block}
+.sc{background:linear-gradient(145deg,#111118,#0d0d14);border:2px solid #333;border-radius:16px;padding:28px 24px;text-align:center;margin-bottom:16px;position:relative;overflow:hidden}
+.sc-glow{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:300px;height:300px;border-radius:50%;filter:blur(80px);opacity:.15;pointer-events:none}
+.sc-num{font-size:4.5em;font-weight:800;line-height:1;position:relative;text-shadow:0 0 30px rgba(255,255,255,.15)}
+.sc-label{font-size:1em;font-weight:700;letter-spacing:3px;margin-top:4px;position:relative}
+.sc-conv{font-size:.8em;font-weight:600;letter-spacing:1px;margin-top:6px;position:relative}
+.sc-conv span{font-weight:400;opacity:.7}
+.sc-sub{color:#888;font-size:.7em;margin-top:6px;position:relative}
+.bar{width:100%;height:20px;position:relative;margin-top:12px}
+.bar-track{position:absolute;top:50%;left:0;right:0;height:5px;border-radius:3px;background:linear-gradient(to right,#059669 0%,#34d399 22%,#b0b0b0 50%,#eab308 65%,#f97316 80%,#ef4444 90%,#dc2626 100%);transform:translateY(-50%);opacity:.75}
+.bar-mid{position:absolute;top:50%;left:50%;width:1px;height:14px;background:#444;transform:translate(-50%,-50%);z-index:1}
+.bar-dot{position:absolute;top:50%;width:14px;height:14px;border-radius:50%;transform:translate(-50%,-50%);z-index:2;border:2px solid rgba(255,255,255,.25);transition:left .8s ease}
+.si{display:flex;gap:3px;align-items:center;justify-content:center;margin-top:8px}
+.si-dot{display:flex;align-items:center;gap:4px;padding:3px 8px;border-radius:4px;font-size:.55em;font-weight:700;letter-spacing:1px;color:#888}
+.si-dot .dot{width:6px;height:6px;border-radius:50%}
+.si-quiet{background:#111118;border:1px solid #1e1e2e}.si-quiet .dot{background:#555}
+.si-active{background:rgba(251,191,36,.08);border:1px solid rgba(251,191,36,.25)}.si-active .dot{background:#fbbf24;box-shadow:0 0 6px #fbbf24}
+.si-alert{background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.25)}.si-alert .dot{background:#f87171;box-shadow:0 0 6px #f87171;animation:pulse 2s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1;box-shadow:0 0 6px currentColor}50%{opacity:.6;box-shadow:0 0 12px currentColor}}
+.rgrid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:16px}
+@media(max-width:600px){.rgrid{grid-template-columns:1fr}}
+.rcard{background:#111118;border:2px solid #333;border-radius:12px;padding:14px;text-align:center;cursor:pointer;transition:all .2s}
+.rcard:hover{border-color:#555;transform:translateY(-2px)}
+.rcard-name{font-size:.6em;text-transform:uppercase;letter-spacing:1.5px;color:#eee;font-weight:600}
+.rcard-score{font-size:2em;font-weight:800}
+.rcard-conv{font-size:.6em;font-weight:600;margin-top:2px}
+.rcard-wt{font-size:.55em;color:#555;margin-top:4px}
+.stage{margin-bottom:12px;background:#0a0a12;border:1px solid #1a1a2e;border-radius:12px;overflow:hidden;transition:border-color .3s}
+.stage-head{padding:12px 16px;cursor:pointer;display:flex;justify-content:space-between;align-items:center}
+.stage-icon{font-size:1.1em;margin-right:10px}
+.stage-title{font-size:.65em;font-weight:700;color:#eee;letter-spacing:1.5px}
+.stage-desc{font-size:.6em;color:#666;margin-top:2px}
+.stage-status{font-size:.6em;font-weight:700;letter-spacing:1px;padding:3px 10px;border-radius:4px}
+.stage-body{padding:0 16px 14px;display:none}.stage.open .stage-body{display:block}
+.stage-arrow{color:#555;font-size:.8em;transition:transform .2s}.stage.open .stage-arrow{transform:rotate(90deg)}
+.stage-ew{font-size:.5em;padding:2px 6px;border-radius:3px;background:rgba(249,115,22,.12);color:#f97316;font-weight:700;letter-spacing:.5px;margin-left:8px}
+.sig{background:#0c0c14;border:1px solid #1e1e2e;border-radius:10px;padding:14px 16px;margin-bottom:8px;transition:border-color .3s}
+.sig-head{display:flex;justify-content:space-between;align-items:flex-start}
+.sig-name{font-size:.75em;font-weight:700;color:#eee;letter-spacing:1.5px;text-transform:uppercase}
+.sig-src{font-size:.55em;color:#888;margin-top:2px}
+.sig-score{font-size:1.8em;font-weight:800;line-height:1}
+.sig-detail{font-size:.7em;color:#aaa;margin-top:6px}
+.sig-alert{font-size:.7em;color:#f87171;margin-top:3px}
+.dd{background:#08080d;border:1px solid #1a1a2e;border-radius:10px;margin-top:8px;overflow:hidden}
+.dd-toggle{font-size:.7em;color:#aaa;padding:10px 14px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;font-weight:600;letter-spacing:1px;text-transform:uppercase}
+.dd-toggle:hover{color:#eee}
+.dd-body{padding:0 14px 12px;display:none}.dd.open .dd-body{display:block}
+.dd-arrow{color:#555;font-size:.7em;transition:transform .2s}.dd.open .dd-arrow{transform:rotate(90deg)}
+.trow{display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-bottom:1px solid #111118}.trow:last-child{border-bottom:none}
+.trow-name{font-size:.85em;color:#fff;font-weight:500}.trow-sub{font-size:.65em;color:#888}
+.trow-stats{display:flex;gap:14px;align-items:center}
+.trow-immature{opacity:.45}
+.trow-spark{min-width:60px;text-align:center}
+.trow-val{font-size:.85em;font-weight:700;min-width:55px;text-align:right}
+.trow-change{font-size:.75em;font-weight:600;min-width:50px;text-align:right}
+.trow-z{font-size:.7em;color:#888;min-width:50px;text-align:right}
+.trow-wt{font-size:.6em;min-width:40px;text-align:right}
+.badge{font-size:.55em;padding:2px 6px;border-radius:4px;font-weight:600;letter-spacing:.5px;margin-left:6px}
+.badge-threat{background:#3a1a1a;color:#ef4444}.badge-deesc{background:#1a2a1a;color:#22c55e}
+.badge-mature{background:#1a1a2e;color:#818cf8}.badge-immature{background:#1a1a1a;color:#555}
+.col-header{font-size:.6em;color:#666;text-transform:uppercase;letter-spacing:1px}
+.graph-ctrl{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:10px;padding:0 4px}
+.graph-tgl{display:flex;align-items:center;gap:5px;font-size:.7em;color:#aaa;cursor:pointer;user-select:none}
+.graph-tgl input{cursor:pointer}
+.tgl-sw{display:inline-block;width:12px;height:3px;border-radius:2px}
+.tf-btn{background:#1a1a2e;border:1px solid #333;color:#888;padding:4px 12px;border-radius:6px;font-size:.65em;cursor:pointer;font-weight:600;letter-spacing:.5px;transition:all .2s}
+.tf-btn:hover{color:#ccc;border-color:#555}.tf-btn.active{background:#2a2a4e;color:#eee;border-color:#555}
+.supp{background:#0a0a12;border:1px solid #1a1a2e;border-radius:12px;margin-bottom:12px;overflow:hidden}
+.supp-head{padding:12px 16px;cursor:pointer;display:flex;justify-content:space-between;align-items:center}
+.supp.open .dd-body{display:block}
+.supp-badge{font-size:.5em;padding:2px 6px;border-radius:3px;background:#1a1a2e;color:#666;font-weight:700}
+.meth-link{display:block;text-align:center;padding:12px;color:#555;font-size:.7em;text-decoration:none;letter-spacing:1px}.meth-link:hover{color:#888}
+footer{text-align:center;padding:16px 0;color:#444;font-size:.65em}
+.err{background:#1a0a0a;border:1px solid #3a1a1a;border-radius:12px;padding:20px;text-align:center;color:#ef4444}
+</style>
 </head>
 <body>
 {% if error %}
 <div class="ctr"><div class="err" style="margin-top:40px">⚠ {{ error }}</div></div>
 {% else %}
-
-<!-- Ticker Strip -->
-<div class="ticker">
-    <div class="ticker-inner" id="ticker-content">
-        {% for a in alerts[:10] %}
-        {% if a.type == 'panic' %}<span>🔴 <span class="ticker-alert">{{ a.text }}</span> ({{ a.region|replace('_',' ')|title }})</span>
-        {% elif a.type == 'cloudflare' %}<span>⚠ <span class="ticker-alert">{{ a.text }}</span> connectivity drop</span>
-        {% elif a.type == 'contract' %}<span>{% if a.risk_rising is defined and not a.risk_rising %}▼ <span style="color:#22c55e">{{ a.text }}</span>{% else %}▲ <span class="ticker-move">{{ a.text }}</span>{% endif %}</span>
-        {% endif %}
-        {% endfor %}
-        {% if not alerts %}<span style="color:#444">Monitoring — no active alerts</span>{% endif %}
-    </div>
-</div>
+<div class="ticker"><div class="ticker-inner" id="ticker-content">
+{% for a in alerts[:10] %}{% if a.type=='panic' %}<span>🔴 <span class="ticker-alert">{{ a.text }}</span> ({{ a.region|replace('_',' ')|title }})</span>{% elif a.type=='cloudflare' %}<span>⚠ <span class="ticker-alert">{{ a.text }}</span> connectivity drop</span>{% elif a.type=='contract' %}<span>{% if a.risk_rising is defined and not a.risk_rising %}▼ <span style="color:#22c55e">{{ a.text }}</span>{% else %}▲ <span class="ticker-move">{{ a.text }}</span>{% endif %}</span>{% endif %}{% endfor %}
+{% if not alerts %}<span style="color:#444">Monitoring — no active alerts</span>{% endif %}
+</div></div>
 
 <div class="ctr">
-    <header>
-        <h1>GEOPOLITICAL RISK INDEX</h1>
-        <div class="sub">3 Regions • Stage-Based Monitoring • Live</div>
-        <div class="live-counter" id="live-counter">Live — just updated</div>
-    </header>
+<header><h1>GEOPOLITICAL RISK INDEX</h1><div class="sub">3 Regions • Stage-Based Monitoring • Live</div><div class="live-counter" id="live-counter">Live — just updated</div></header>
 
-    <!-- Tab Bar -->
-    <div class="tabs">
-        <div class="tab active" onclick="switchView('global')">Global<span class="tab-score" style="color:{{ risk_colour }}">{{ composite_score }}</span></div>
-        {% for rk, rd in regional_composites.items() %}
-        <div class="tab" onclick="switchView('{{ rk }}')">{{ regions[rk].name }}<span class="tab-score" style="color:{{ rd.colour }}">{{ rd.composite }}</span></div>
-        {% endfor %}
-    </div>
+<div class="tabs">
+<div class="tab active" onclick="switchView('global')">Global<span class="tab-score" style="color:{{ risk_colour }}">{{ composite_score }}</span></div>
+{% for rk, rd in regional_composites.items() %}<div class="tab" onclick="switchView('{{ rk }}')">{{ regions[rk].name }}<span class="tab-score" style="color:{{ rd.colour }}">{{ rd.composite }}</span></div>{% endfor %}
+</div>
 
-    <!-- ==================== GLOBAL VIEW ==================== -->
-    <div class="view active" id="view-global">
-        <div class="sc" style="border-color:{{ risk_colour }}">
-            <div class="sc-glow" style="background:{{ risk_colour }}"></div>
-            <div class="sc-num" style="color:{{ risk_colour }}">{{ composite_score }}</div>
-            <div class="sc-label" style="color:{{ risk_colour }}">{{ risk_level }}</div>
-            <div class="sc-sub">Dynamic regional aggregate — 50 = normal baseline</div>
-            <div class="bar"><div class="bar-track"></div><div class="bar-mid"></div>
-                <div class="bar-dot" style="left:{{ composite_score }}%;background:{{ risk_colour }};box-shadow:0 0 10px {{ risk_colour }}44"></div></div>
-        </div>
+<!-- GLOBAL VIEW -->
+<div class="view active" id="view-global">
+<div class="sc" style="border-color:{{ risk_colour }}"><div class="sc-glow" style="background:{{ risk_colour }}"></div>
+<div class="sc-num" style="color:{{ risk_colour }}">{{ composite_score }}</div>
+<div class="sc-label" style="color:{{ risk_colour }}">{{ risk_level }}</div>
+<div class="sc-sub">Dynamic regional aggregate — 50 = normal baseline</div>
+<div class="bar"><div class="bar-track"></div><div class="bar-mid"></div><div class="bar-dot" style="left:{{ composite_score }}%;background:{{ risk_colour }};box-shadow:0 0 10px {{ risk_colour }}44"></div></div></div>
 
-        <div class="rgrid">
-            {% for rk, rd in regional_composites.items() %}
-            <div class="rcard" id="rcard-{{ rk }}" style="border-color:{{ rd.colour }}33" onclick="switchView('{{ rk }}')">
-                <div class="rcard-name">{{ regions[rk].name }}</div>
-                <div class="rcard-score" style="color:{{ rd.colour }}">{{ rd.composite }}</div>
-                <div class="rcard-conv" style="color:{{ rd.convergence_colour }}">{{ rd.convergence_label }}</div>
-                <div class="si">
-                    {% set s1_max = rd.signals.cloudflare %}
-                    {% set s2_max = rd.signals.gt_panic %}
-                    {% set s3_max = [rd.signals.polymarket, rd.signals.markets]|max %}
-                    {% set s4_max = [rd.signals.gdelt, rd.signals.gt_global]|max %}
-                    {% for sv in [s1_max, s2_max, s3_max, s4_max] %}
-                    <div class="si-dot {% if sv >= 70 %}si-alert{% elif sv >= 58 %}si-active{% else %}si-quiet{% endif %}">
-                        S{{ loop.index }}<div class="dot"></div>
-                    </div>
-                    {% endfor %}
-                </div>
-                <div class="bar" style="height:14px;margin-top:6px"><div class="bar-track" style="height:3px"></div><div class="bar-mid" style="height:8px"></div>
-                    <div class="bar-dot" style="left:{{ rd.composite }}%;background:{{ rd.colour }};width:10px;height:10px;box-shadow:0 0 8px {{ rd.colour }}44"></div></div>
-                <div class="rcard-wt">Weight: {{ (regional_weights.get(rk, 0.333) * 100)|round(1) }}%</div>
-            </div>
-            {% endfor %}
-        </div>
+<div class="rgrid">{% for rk, rd in regional_composites.items() %}
+<div class="rcard" id="rcard-{{ rk }}" style="border-color:{{ rd.colour }}33" onclick="switchView('{{ rk }}')">
+<div class="rcard-name">{{ regions[rk].name }}</div><div class="rcard-score" style="color:{{ rd.colour }}">{{ rd.composite }}</div>
+<div class="rcard-conv" style="color:{{ rd.convergence_colour }}">{{ rd.convergence_label }}</div>
+<div class="si">{% set s1=rd.signals.cloudflare %}{% set s2=rd.signals.gt_panic %}{% set s3=[rd.signals.polymarket,rd.signals.markets]|max %}{% set s4=[rd.signals.gdelt,rd.signals.gt_global]|max %}
+{% for sv in [s1,s2,s3,s4] %}<div class="si-dot {% if sv>=70 %}si-alert{% elif sv>=58 %}si-active{% else %}si-quiet{% endif %}">S{{ loop.index }}<div class="dot"></div></div>{% endfor %}</div>
+<div class="bar" style="height:14px;margin-top:6px"><div class="bar-track" style="height:3px"></div><div class="bar-mid" style="height:8px"></div><div class="bar-dot" style="left:{{ rd.composite }}%;background:{{ rd.colour }};width:10px;height:10px;box-shadow:0 0 8px {{ rd.colour }}44"></div></div>
+<div class="rcard-wt">Weight: {{ (regional_weights.get(rk,0.333)*100)|round(1) }}%</div></div>{% endfor %}</div>
 
-        <!-- Global PM -->
-        {% if global_pm_score is defined %}
-        <div style="background:#111118;border:1px solid #1e1e2e;border-radius:12px;padding:12px 18px;margin-bottom:14px;display:flex;justify-content:space-between;align-items:center">
-            <div>
-                <div style="font-size:0.65em;text-transform:uppercase;letter-spacing:1.5px;color:#eee;font-weight:600">Global Polymarket Contracts</div>
-                <div style="font-size:0.65em;color:#888;margin-top:2px">{{ global_pm_stats.num_contracts }} contracts ({{ global_pm_stats.mature_count }} mature) • {{ (GLOBAL_PM_WEIGHT*100)|int }}% of global score{% if global_pm_stats.agg_z is defined %} • z={{ global_pm_stats.agg_z }}{% endif %}</div>
-            </div>
-            <div style="font-size:1.6em;font-weight:800;color:{{ global_pm_colour }}">{{ global_pm_score }}</div>
-        </div>
-        {% endif %}
+{% if global_pm_score is defined %}<div style="background:#111118;border:1px solid #1e1e2e;border-radius:12px;padding:12px 18px;margin-bottom:14px;display:flex;justify-content:space-between;align-items:center"><div><div style="font-size:.65em;text-transform:uppercase;letter-spacing:1.5px;color:#eee;font-weight:600">Global Polymarket Contracts</div><div style="font-size:.65em;color:#888;margin-top:2px">{{ global_pm_stats.num_contracts }} contracts ({{ global_pm_stats.mature_count }} mature) • {{ (GLOBAL_PM_WEIGHT*100)|int }}% of global score{% if global_pm_stats.agg_z is defined %} • z={{ global_pm_stats.agg_z }}{% endif %}</div></div><div style="font-size:1.6em;font-weight:800;color:{{ global_pm_colour }}">{{ global_pm_score }}</div></div>{% endif %}
 
-        <!-- Global Contracts Dropdown -->
-        {% if global_contracts %}
-        <div class="dd" id="dd-global-contracts">
-            <div class="dd-toggle" onclick="toggleDD('dd-global-contracts')">Global Risk Contracts — {{ global_contracts|length }} tracked <span class="dd-arrow">▸</span></div>
-            <div class="dd-body">
-                <div class="trow" style="border-bottom:2px solid #1a1a2e;padding-bottom:4px;margin-bottom:4px">
-                    <div><span class="col-header">Contract</span></div>
-                    <div class="trow-stats">
-                        <div class="trow-spark"><span class="col-header">48h</span></div>
-                        <div class="trow-val"><span class="col-header" style="font-weight:400">Odds</span></div>
-                        <div class="trow-change"><span class="col-header" style="font-weight:400">24h Δ</span></div>
-                        <div class="trow-z"><span class="col-header">Z</span></div>
-                        <div class="trow-wt"><span class="col-header">Weight</span></div>
-                    </div>
-                </div>
-                {% for c in global_contracts %}
-                <div class="trow{% if not c.is_mature %} trow-immature{% endif %}">
-                    <div style="flex:1;min-width:0">
-                        <div style="font-size:0.82em;color:#eee;line-height:1.4;padding-right:10px">{{ c.question }}
-                            {% if c.is_deescalation %}<span class="badge badge-deesc">DE-ESC</span>{% else %}<span class="badge badge-threat">THREAT</span>{% endif %}
-                            {% if c.is_mature %}<span class="badge badge-mature">MATURE ({{ c.dp_count }})</span>{% else %}<span class="badge badge-immature">IMMATURE ({{ c.dp_count }})</span>{% endif %}
-                        </div>
-                    </div>
-                    <div class="trow-stats">
-                        <div class="trow-spark">{{ c.sparkline_svg|safe }}</div>
-                        <div class="trow-val" style="color:{{ c.colour }}">{{ c.probability_pct }}%</div>
-                        {% if c.change_24h is not none %}<div class="trow-change" style="color:{{ c.change_colour }}">{% if c.change_24h > 0 %}+{% endif %}{{ c.change_24h }}pp</div>{% else %}<div class="trow-change" style="color:#333">—</div>{% endif %}
-                        {% if c.z_score is not none %}<div class="trow-z">{{ c.z_score }}</div>{% else %}<div class="trow-z" style="color:#333">—</div>{% endif %}
-                        {% if c.contrib_pct is not none %}<div class="trow-wt" style="color:{% if c.contrib_dir == 'up' %}#f97316{% elif c.contrib_dir == 'down' %}#22c55e{% else %}#555{% endif %}">{{ c.contrib_pct }}%{% if c.contrib_dir == 'up' %}↑{% elif c.contrib_dir == 'down' %}↓{% endif %}</div>{% else %}<div class="trow-wt" style="color:#333">—</div>{% endif %}
-                    </div>
-                </div>
-                {% endfor %}
-            </div>
-        </div>
-        {% endif %}
+{% if global_contracts %}<div class="dd" id="dd-global-contracts"><div class="dd-toggle" onclick="toggleDD('dd-global-contracts')">Global Risk Contracts — {{ global_contracts|length }} tracked <span class="dd-arrow">▸</span></div><div class="dd-body">
+<div class="trow" style="border-bottom:2px solid #1a1a2e;padding-bottom:4px;margin-bottom:4px"><div><span class="col-header">Contract</span></div><div class="trow-stats"><div class="trow-spark"><span class="col-header">48h</span></div><div class="trow-val"><span class="col-header" style="font-weight:400">Odds</span></div><div class="trow-change"><span class="col-header" style="font-weight:400">24h Δ</span></div><div class="trow-z"><span class="col-header">Z</span></div><div class="trow-wt"><span class="col-header">Weight</span></div></div></div>
+{% for c in global_contracts %}<div class="trow{% if not c.is_mature %} trow-immature{% endif %}"><div style="flex:1;min-width:0"><div style="font-size:.82em;color:#eee;line-height:1.4;padding-right:10px">{{ c.question }}{% if c.is_deescalation %}<span class="badge badge-deesc">DE-ESC</span>{% else %}<span class="badge badge-threat">THREAT</span>{% endif %}{% if not c.is_mature %}<span class="badge badge-immature">IMMATURE</span>{% elif c.is_new %}<span class="badge" style="background:#1a2a1a;color:#fbbf24">NEW</span>{% endif %}</div></div><div class="trow-stats"><div class="trow-spark">{{ c.sparkline_svg|safe }}</div><div class="trow-val" style="color:{{ c.colour }}">{{ c.probability_pct }}%</div>{% if c.change_24h is not none %}<div class="trow-change" style="color:{{ c.change_colour }}">{% if c.change_24h>0 %}+{% endif %}{{ c.change_24h }}pp</div>{% else %}<div class="trow-change" style="color:#333">—</div>{% endif %}{% if c.z_score is not none %}<div class="trow-z">{{ c.z_score }}</div>{% else %}<div class="trow-z" style="color:#333">—</div>{% endif %}{% if c.contrib_pct is not none %}<div class="trow-wt" style="color:{% if c.contrib_dir=='up' %}#f97316{% elif c.contrib_dir=='down' %}#22c55e{% else %}#555{% endif %}">{{ c.contrib_pct }}%{% if c.contrib_dir=='up' %}↑{% elif c.contrib_dir=='down' %}↓{% endif %}</div>{% else %}<div class="trow-wt" style="color:#333">—</div>{% endif %}</div></div>{% endfor %}
+</div></div>{% endif %}
 
-        <!-- Score History -->
-        {% if score_history and score_history|length > 1 %}
-        <div class="dd open" id="dd-global-history">
-            <div class="dd-toggle" onclick="toggleDD('dd-global-history')">Score History ({{ score_history|length }} snapshots) <span class="dd-arrow">▸</span></div>
-            <div class="dd-body">
-                <div class="graph-ctrl">
-                    <label class="graph-tgl"><input type="checkbox" id="tgl-composite" checked onchange="redrawGlobalChart()"><span class="tgl-sw" style="background:#eab308"></span> Global</label>
-                    <label class="graph-tgl"><input type="checkbox" id="tgl-europe" onchange="redrawGlobalChart()"><span class="tgl-sw" style="background:#818cf8"></span> Europe</label>
-                    <label class="graph-tgl"><input type="checkbox" id="tgl-middle_east" onchange="redrawGlobalChart()"><span class="tgl-sw" style="background:#fbbf24"></span> M.East</label>
-                    <label class="graph-tgl"><input type="checkbox" id="tgl-asia_pacific" onchange="redrawGlobalChart()"><span class="tgl-sw" style="background:#34d399"></span> Asia-Pac</label>
-                </div>
-                <div style="display:flex;gap:6px;margin-bottom:10px">
-                    <button class="tf-btn active" onclick="setGlobalTF('48h')">48h</button>
-                    <button class="tf-btn" onclick="setGlobalTF('1w')">1W</button>
-                    <button class="tf-btn" onclick="setGlobalTF('1m')">1M</button>
-                    <button class="tf-btn" onclick="setGlobalTF('all')">All</button>
-                </div>
-                <div style="width:100%;height:200px;position:relative"><canvas id="globalChart"></canvas></div>
-            </div>
-        </div>
-        {% endif %}
+{% if score_history and score_history|length>1 %}<div class="dd open" id="dd-global-history"><div class="dd-toggle" onclick="toggleDD('dd-global-history')">Score History ({{ score_history|length }} snapshots) <span class="dd-arrow">▸</span></div><div class="dd-body">
+<div class="graph-ctrl"><label class="graph-tgl"><input type="checkbox" id="tgl-composite" checked onchange="redrawGlobalChart()"><span class="tgl-sw" style="background:#eab308"></span> Global</label><label class="graph-tgl"><input type="checkbox" id="tgl-europe" onchange="redrawGlobalChart()"><span class="tgl-sw" style="background:#818cf8"></span> Europe</label>                    <label class="graph-tgl"><input type="checkbox" id="tgl-middle_east" onchange="redrawGlobalChart()"><span class="tgl-sw" style="background:#fbbf24"></span> Middle East</label><label class="graph-tgl"><input type="checkbox" id="tgl-asia_pacific" onchange="redrawGlobalChart()"><span class="tgl-sw" style="background:#34d399"></span> Asia-Pacific</label></div>
+<div style="display:flex;gap:6px;margin-bottom:10px"><button class="tf-btn active" onclick="setGlobalTF('48h')">48h</button><button class="tf-btn" onclick="setGlobalTF('1w')">1W</button><button class="tf-btn" onclick="setGlobalTF('1m')">1M</button><button class="tf-btn" onclick="setGlobalTF('all')">All</button></div>
+<div style="width:100%;height:200px;position:relative"><canvas id="globalChart"></canvas></div></div></div>{% endif %}
 
-        <!-- ACLED Supplemental -->
-        {% if acled_supplemental and acled_supplemental.top_countries is defined %}
-        <div class="supp" id="dd-acled-global">
-            <div class="supp-head" onclick="toggleDD('dd-acled-global')">
-                <div style="display:flex;align-items:center;gap:10px">
-                    <span>📋</span>
-                    <span style="font-size:0.65em;font-weight:700;color:#888;letter-spacing:1.5px">ACLED CONFLICT FORECAST — {{ acled_supplemental.forecast_period }}</span>
-                    <span class="supp-badge">SUPPLEMENTAL</span>
-                </div>
-                <span class="dd-arrow">▸</span>
-            </div>
-            <div class="dd-body">
-                <div style="font-size:0.7em;color:#666;margin-bottom:8px">Monthly forecast — shown for context, does not affect scores.</div>
-                {% for cn, ct in acled_supplemental.top_countries %}
-                <div class="trow"><div class="trow-name">{{ cn }} <span style="font-size:0.7em;color:#666;margin-left:6px">⚔{{ ct.battles }} 💥{{ ct.erv }} 👤{{ ct.vac }}</span></div>
-                    <div style="font-size:0.85em;font-weight:600;color:#f97316">{{ "{:,}".format(ct.total) }}</div></div>
-                {% endfor %}
-            </div>
-        </div>
-        {% endif %}
-    </div>
+{% if acled_supplemental and acled_supplemental.top_countries is defined %}<div class="supp" id="dd-acled-global"><div class="supp-head" onclick="toggleDD('dd-acled-global')"><div style="display:flex;align-items:center;gap:10px"><span>📋</span><span style="font-size:.65em;font-weight:700;color:#888;letter-spacing:1.5px">ACLED CONFLICT FORECAST — {{ acled_supplemental.forecast_period }}</span><span class="supp-badge">SUPPLEMENTAL</span></div><span class="dd-arrow">▸</span></div><div class="dd-body"><div style="font-size:.7em;color:#666;margin-bottom:8px">Monthly forecast — shown for context, does not affect scores.</div>{% for cn,ct in acled_supplemental.top_countries %}<div class="trow"><div class="trow-name">{{ cn }} <span style="font-size:.7em;color:#666;margin-left:6px">⚔{{ ct.battles }} 💥{{ ct.erv }} 👤{{ ct.vac }}</span></div><div style="font-size:.85em;font-weight:600;color:#f97316">{{ "{:,}".format(ct.total) }}</div></div>{% endfor %}</div></div>{% endif %}
+</div>
 
-    <!-- ==================== REGIONAL VIEWS ==================== -->
-    {% for rk, rd in regional_composites.items() %}
-    <div class="view" id="view-{{ rk }}">
-        <!-- Region Score Card -->
-        <div class="sc" style="border-color:{{ rd.colour }}">
-            <div class="sc-glow" style="background:{{ rd.colour }}"></div>
-            <div class="sc-num" style="color:{{ rd.colour }}">{{ rd.composite }}</div>
-            <div class="sc-label" style="color:{{ rd.colour }}">{{ regions[rk].name|upper }}</div>
-            <div class="sc-conv" style="color:{{ rd.convergence_colour }}">{{ rd.convergence_label }}
-                {% if rd.convergence_detail %}<span>— {{ rd.convergence_detail }}</span>{% endif %}</div>
-            <div class="si">
-                {% set s1_max = rd.signals.cloudflare %}
-                {% set s2_max = rd.signals.gt_panic %}
-                {% set s3_max = [rd.signals.polymarket, rd.signals.markets]|max %}
-                {% set s4_max = [rd.signals.gdelt, rd.signals.gt_global]|max %}
-                {% for sv in [s1_max, s2_max, s3_max, s4_max] %}
-                <div class="si-dot {% if sv >= 70 %}si-alert{% elif sv >= 58 %}si-active{% else %}si-quiet{% endif %}">
-                    S{{ loop.index }}<div class="dot"></div>
-                </div>
-                {% endfor %}
-            </div>
-            <div class="sc-sub">Composite: 37.5% Polymarket • 37.5% Financial Markets • 25% Panic Search • Stage 1 & 4 = context</div>
-            <div class="bar"><div class="bar-track"></div><div class="bar-mid"></div>
-                <div class="bar-dot" style="left:{{ rd.composite }}%;background:{{ rd.colour }};box-shadow:0 0 10px {{ rd.colour }}44"></div></div>
-        </div>
+<!-- REGIONAL VIEWS -->
+{% for rk, rd in regional_composites.items() %}
+<div class="view" id="view-{{ rk }}">
+{% set rh=regional_history.get(rk,[]) %}
+<div class="sc" style="border-color:{{ rd.colour }}"><div class="sc-glow" style="background:{{ rd.colour }}"></div><div class="sc-num" style="color:{{ rd.colour }}">{{ rd.composite }}</div><div class="sc-label" style="color:{{ rd.colour }}">{{ regions[rk].name|upper }}</div><div class="sc-conv" style="color:{{ rd.convergence_colour }}">{{ rd.convergence_label }}{% if rd.convergence_detail %}<span>— {{ rd.convergence_detail }}</span>{% endif %}</div>
+<div class="si">{% set s1=rd.signals.cloudflare %}{% set s2=rd.signals.gt_panic %}{% set s3=[rd.signals.polymarket,rd.signals.markets]|max %}{% set s4=[rd.signals.gdelt,rd.signals.gt_global]|max %}{% for sv in [s1,s2,s3,s4] %}<div class="si-dot {% if sv>=70 %}si-alert{% elif sv>=58 %}si-active{% else %}si-quiet{% endif %}">S{{ loop.index }}<div class="dot"></div></div>{% endfor %}</div>
+<div class="sc-sub">Composite: 37.5% Polymarket • 37.5% Financial Markets • 25% Panic Search • Stage 1 & 4 = context</div>
+<div class="bar"><div class="bar-track"></div><div class="bar-mid"></div><div class="bar-dot" style="left:{{ rd.composite }}%;background:{{ rd.colour }};box-shadow:0 0 10px {{ rd.colour }}44"></div></div></div>
 
-        <!-- STAGE 1 — PHYSICAL OBSERVABLE -->
-        {% set cfs = rd.cloudflare_stats %}
-        {% set s1_status = 'ALERT' if rd.signals.cloudflare >= 70 else ('ACTIVE' if rd.signals.cloudflare >= 58 else 'QUIET') %}
-        {% set s1_col = '#f87171' if s1_status == 'ALERT' else ('#fbbf24' if s1_status == 'ACTIVE' else '#555') %}
-        <div class="stage {% if s1_status != 'QUIET' %}open{% endif %}" id="stage-{{ rk }}-1" style="border-color:{{ s1_col }}44">
-            <div class="stage-head" onclick="toggleStage('stage-{{ rk }}-1')">
-                <div style="display:flex;align-items:center">
-                    <span class="stage-icon">⚡</span>
-                    <div>
-                        <div class="stage-title">STAGE 1 — PHYSICAL OBSERVABLE <span class="stage-ew">EARLY WARNING</span></div>
-                        <div class="stage-desc">Infrastructure disruptions detectable before anyone reports them</div>
-                    </div>
-                </div>
-                <div style="display:flex;align-items:center;gap:10px">
-                    <span class="stage-status" style="color:{{ s1_col }};background:{{ s1_col }}18;border:1px solid {{ s1_col }}33">{{ s1_status }}</span>
-                    <span class="stage-arrow">▸</span>
-                </div>
-            </div>
-            <div class="stage-body">
-                <div class="sig" style="border-color:{{ rd.cloudflare_colour }}33">
-                    <div class="sig-head">
-                        <div><div class="sig-name">Internet Connectivity</div><div class="sig-src">Cloudflare Radar • Early Warning — Not Scored</div></div>
-                        <div class="sig-score" style="color:{{ rd.cloudflare_colour }}">{{ rd.signals.cloudflare }}</div>
-                    </div>
-                    {% if cfs and cfs.countries_with_data is defined and cfs.countries_with_data > 0 %}
-                    <div class="sig-detail">{{ cfs.countries_with_data }}/{{ cfs.countries_checked }} countries • agg z={{ cfs.agg_z }}</div>
-                    {% if cfs.outages %}{% for o in cfs.outages[:2] %}
-                    <div class="sig-alert" style="word-break:break-word">🔴 {{ o.date[:10] }} — {{ o.location }}: {{ o.description }}</div>
-                    {% endfor %}{% endif %}
-                    {% elif cloudflare_fetching %}
-                    <div class="sig-detail" style="color:#fbbf24">⏳ Fetching Cloudflare data...</div>
-                    {% else %}<div class="sig-detail" style="color:#666">Waiting for first fetch cycle</div>{% endif %}
-                    <div class="bar" style="height:14px"><div class="bar-track" style="height:3px"></div><div class="bar-mid" style="height:8px"></div>
-                        <div class="bar-dot" style="left:{{ rd.signals.cloudflare }}%;background:{{ rd.cloudflare_colour }};width:10px;height:10px"></div></div>
-                </div>
-                <!-- Cloudflare Country Detail -->
-                {% if cfs and cfs.country_details is defined and cfs.country_details %}
-                <div class="dd" id="dd-{{ rk }}-cf">
-                    <div class="dd-toggle" onclick="toggleDD('dd-{{ rk }}-cf')">Country Details — {{ cfs.countries_with_data }}/{{ cfs.countries_checked }} <span class="dd-arrow">▸</span></div>
-                    <div class="dd-body">
-                        <div style="font-size:0.65em;color:#666;margin-bottom:6px">Current hour vs same hour over prior 29 days</div>
-                        {% for c in cfs.country_details|sort(attribute='z') %}
-                        <div class="trow">
-                            <div><div class="trow-name">{% if c.z < -1.5 %}🔴 {% endif %}{{ country_names.get(c.code, c.code) }}</div><div class="trow-sub">{{ c.code }} • this hour: {{ c.current_hour }}{% if c.baseline_hour_avg %} • 29d avg: {{ c.baseline_hour_avg }}{% endif %}</div></div>
-                            <div class="trow-z" style="color:{% if c.z < -1.5 %}#f87171{% elif c.z < -0.5 %}#ef4444{% elif c.z > 0.5 %}#22c55e{% else %}#888{% endif %}">z={{ c.z }}</div>
-                        </div>
-                        {% endfor %}
-                        {% if cfs.outages %}
-                        <div style="font-size:0.65em;color:#666;margin:10px 0 6px">VERIFIED OUTAGES — Cloudflare Radar Outage Center</div>
-                        {% for o in cfs.outages %}
-                        <div class="trow">
-                            <div><div class="trow-name" style="color:#f87171">{{ o.location }}</div><div class="trow-sub">{{ o.date }} — {{ o.end }}{% if o.scope %} • {{ o.scope }}{% endif %}</div></div>
-                            <div style="font-size:0.7em;color:#aaa;max-width:250px;word-break:break-word">{{ o.description }}</div>
-                        </div>
-                        {% endfor %}{% endif %}
-                    </div>
-                </div>
-                {% endif %}
-            </div>
-        </div>
+<!-- Synced timeframe controls -->
+<div style="display:flex;gap:6px;margin-bottom:12px" id="tf-{{ rk }}">
+</div>
 
-        <!-- STAGE 2 — GROUND SIGNAL -->
-        {% set gts = rd.gtrends_stats %}
-        {% set s2_status = 'ALERT' if rd.signals.gt_panic >= 70 else ('ACTIVE' if rd.signals.gt_panic >= 58 else 'QUIET') %}
-        {% set s2_col = '#f87171' if s2_status == 'ALERT' else ('#fbbf24' if s2_status == 'ACTIVE' else '#555') %}
-        <div class="stage {% if s2_status != 'QUIET' %}open{% endif %}" id="stage-{{ rk }}-2" style="border-color:{{ s2_col }}44">
-            <div class="stage-head" onclick="toggleStage('stage-{{ rk }}-2')">
-                <div style="display:flex;align-items:center">
-                    <span class="stage-icon">📡</span>
-                    <div>
-                        <div class="stage-title">STAGE 2 — GROUND SIGNAL</div>
-                        <div class="stage-desc">Local populations and early observers reacting</div>
-                    </div>
-                </div>
-                <div style="display:flex;align-items:center;gap:10px">
-                    <span class="stage-status" style="color:{{ s2_col }};background:{{ s2_col }}18;border:1px solid {{ s2_col }}33">{{ s2_status }}</span>
-                    <span class="stage-arrow">▸</span>
-                </div>
-            </div>
-            <div class="stage-body">
-                <div class="sig" style="border-color:{{ rd.gt_panic_colour }}33">
-                    <div class="sig-head">
-                        <div><div class="sig-name">Panic Search Trends</div><div class="sig-src">Google Trends • Weight: 25%</div></div>
-                        <div class="sig-score" style="color:{{ rd.gt_panic_colour }}">{{ rd.signals.gt_panic }}</div>
-                    </div>
-                    {% if gts and gts.l2_count is defined and gts.l2_count > 0 %}
-                    <div class="sig-detail">Panic terms z={{ gts.layer2_z }} ({{ gts.l2_count }}/{{ gtrends_expected.get(rk, {}).get('l2', '?') }})</div>
-                    {% if gts.panic_alerts %}{% for alert in gts.panic_alerts %}
-                    <div class="sig-alert">🔴 {{ alert.term }}: z={{ alert.z }}</div>
-                    {% endfor %}{% endif %}
-                    {% elif gtrends_fetching and not gtrends_regional %}
-                    <div class="sig-detail" style="color:#fbbf24">⏳ Fetching panic search data...</div>
-                    {% else %}<div class="sig-detail" style="color:#666">Waiting for first fetch cycle</div>{% endif %}
-                    <div class="bar" style="height:14px"><div class="bar-track" style="height:3px"></div><div class="bar-mid" style="height:8px"></div>
-                        <div class="bar-dot" style="left:{{ rd.signals.gt_panic }}%;background:{{ rd.gt_panic_colour }};width:10px;height:10px"></div></div>
-                </div>
-                <!-- Panic Terms Detail -->
-                {% if gts and gts.layer2_terms is defined and gts.layer2_terms %}
-                <div class="dd" id="dd-{{ rk }}-panic">
-                    <div class="dd-toggle" onclick="toggleDD('dd-{{ rk }}-panic')">Panic Terms — {{ gts.l2_count }}/{{ gtrends_expected.get(rk, {}).get('l2', '?') }} succeeded <span class="dd-arrow">▸</span></div>
-                    <div class="dd-body">
-                        {% set ns = namespace(shown=0) %}
-                        {% for t in gts.layer2_terms %}
-                        {% if t.z|abs > 0.3 %}{% set ns.shown = ns.shown + 1 %}
-                        <div class="trow">
-                            <div><div class="trow-name">{% if t.z > 1.5 %}🔴 {% endif %}{{ t.term }}</div><div class="trow-sub">panic indicator</div></div>
-                            <div class="trow-z" style="color:{% if t.z > 1.5 %}#f87171{% elif t.z > 0.5 %}#ef4444{% elif t.z < -0.5 %}#22c55e{% else %}#888{% endif %}">z={{ t.z }}</div>
-                        </div>
-                        {% endif %}
-                        {% endfor %}
-                        {% if ns.shown == 0 %}<div style="font-size:0.7em;color:#555;padding:8px 0">All {{ gts.l2_count }} terms within normal range (|z| < 0.3)</div>
-                        {% elif ns.shown < gts.l2_count %}<div style="font-size:0.7em;color:#555;padding:8px 0">{{ gts.l2_count - ns.shown }} more term{{ 's' if gts.l2_count - ns.shown != 1 }} within normal range</div>{% endif %}
-                    </div>
-                </div>
-                {% endif %}
-            </div>
-        </div>
+<!-- S1 PHYSICAL -->
+{% set cfs=rd.cloudflare_stats %}{% set s1s='ALERT' if rd.signals.cloudflare>=70 else ('ACTIVE' if rd.signals.cloudflare>=58 else 'QUIET') %}{% set s1c='#f87171' if s1s=='ALERT' else ('#fbbf24' if s1s=='ACTIVE' else '#555') %}
+<div class="stage {% if s1s!='QUIET' %}open{% endif %}" id="stage-{{ rk }}-1" style="border-color:{{ s1c }}44"><div class="stage-head" onclick="toggleStage('stage-{{ rk }}-1')"><div style="display:flex;align-items:center"><span class="stage-icon">⚡</span><div><div class="stage-title">STAGE 1 — PHYSICAL OBSERVABLE <span class="stage-ew">EARLY WARNING</span></div><div class="stage-desc">Infrastructure disruptions detectable before anyone reports them</div></div></div><div style="display:flex;align-items:center;gap:10px"><span class="stage-status" style="color:{{ s1c }};background:{{ s1c }}18;border:1px solid {{ s1c }}33">{{ s1s }}</span><span class="stage-arrow">▸</span></div></div>
+<div class="stage-body"><div class="sig" style="border-color:{{ rd.cloudflare_colour }}33"><div class="sig-head"><div><div class="sig-name">Internet Connectivity</div><div class="sig-src">Cloudflare Radar • Early Warning — Not Scored</div></div><div class="sig-score" style="color:{{ rd.cloudflare_colour }}">{{ rd.signals.cloudflare }}</div></div>
+{% if cfs and cfs.countries_with_data is defined and cfs.countries_with_data>0 %}<div class="sig-detail">{{ cfs.countries_with_data }}/{{ cfs.countries_checked }} countries • agg z={{ cfs.agg_z }}</div>{% if cfs.outages %}{% for o in cfs.outages[:2] %}<div class="sig-alert" style="word-break:break-word">🔴 {{ o.date[:10] }} — {{ o.location }}: {{ o.description }}</div>{% endfor %}{% endif %}{% elif cloudflare_fetching %}<div class="sig-detail" style="color:#fbbf24">⏳ Fetching Cloudflare data...</div>{% else %}<div class="sig-detail" style="color:#666">Waiting for first fetch cycle</div>{% endif %}
+<div class="bar" style="height:14px"><div class="bar-track" style="height:3px"></div><div class="bar-mid" style="height:8px"></div><div class="bar-dot" style="left:{{ rd.signals.cloudflare }}%;background:{{ rd.cloudflare_colour }};width:10px;height:10px"></div></div></div>
+{% if cfs and cfs.country_details is defined and cfs.country_details %}<div class="dd" id="dd-{{ rk }}-cf"><div class="dd-toggle" onclick="toggleDD('dd-{{ rk }}-cf')">Country Details — {{ cfs.countries_with_data }}/{{ cfs.countries_checked }} <span class="dd-arrow">▸</span></div><div class="dd-body"><div style="font-size:.65em;color:#666;margin-bottom:6px">Current hour vs same hour over prior 29 days</div>{% for c in cfs.country_details|sort(attribute='z') %}<div class="trow"><div><div class="trow-name">{% if c.z<-1.5 %}🔴 {% endif %}{{ country_names.get(c.code,c.code) }}</div><div class="trow-sub">{{ c.code }} • this hour: {{ c.current_hour }}{% if c.baseline_hour_avg %} • 29d avg: {{ c.baseline_hour_avg }}{% endif %}</div></div><div class="trow-z" style="color:{% if c.z<-1.5 %}#f87171{% elif c.z<-0.5 %}#ef4444{% elif c.z>0.5 %}#22c55e{% else %}#888{% endif %}">z={{ c.z }}</div></div>{% endfor %}
+{% if cfs.outages %}<div style="font-size:.65em;color:#666;margin:10px 0 6px">VERIFIED OUTAGES — Cloudflare Radar Outage Center</div>{% for o in cfs.outages %}<div class="trow"><div><div class="trow-name" style="color:#f87171">{{ o.location }}</div><div class="trow-sub">{{ o.date }} — {{ o.end }}{% if o.scope %} • {{ o.scope }}{% endif %}</div></div><div style="font-size:.7em;color:#aaa;max-width:250px;word-break:break-word">{{ o.description }}</div></div>{% endfor %}{% endif %}</div></div>{% endif %}
+                {% if rh and rh|length>1 %}<div style="margin-top:8px"><div class="graph-ctrl">
+                    <label class="graph-tgl"><input type="checkbox" id="tgl-{{ rk }}-s1-score" checked onchange="drawStageChart('{{ rk }}','s1')"><span class="tgl-sw" style="background:#eab308"></span> Composite</label>
+                    <label class="graph-tgl"><input type="checkbox" id="tgl-{{ rk }}-s1-cloudflare" checked onchange="drawStageChart('{{ rk }}','s1')"><span class="tgl-sw" style="background:#06b6d4"></span> Internet Traffic</label>
+                    <div style="margin-left:auto;display:flex;gap:4px"><button class="tf-btn active" onclick="setRTFStage('{{ rk }}','s1','48h',this)">48h</button><button class="tf-btn" onclick="setRTFStage('{{ rk }}','s1','1w',this)">1W</button><button class="tf-btn" onclick="setRTFStage('{{ rk }}','s1','1m',this)">1M</button><button class="tf-btn" onclick="setRTFStage('{{ rk }}','s1','all',this)">All</button></div>
+                </div><div style="width:100%;height:200px;position:relative"><canvas id="chart-{{ rk }}-s1"></canvas></div></div>{% endif %}
+            </div></div>
 
-        <!-- STAGE 3 — MARKET POSITIONING -->
-        {% set rps = rd.pm_stats %}
-        {% set s3_pm = rd.signals.polymarket %}
-        {% set s3_mkt = rd.signals.markets %}
-        {% set s3_status = 'ALERT' if s3_pm >= 70 or s3_mkt >= 70 else ('ACTIVE' if s3_pm >= 58 or s3_mkt >= 58 else 'QUIET') %}
-        {% set s3_col = '#f87171' if s3_status == 'ALERT' else ('#fbbf24' if s3_status == 'ACTIVE' else '#555') %}
-        {% set s3_diverging = (s3_pm >= 58 and s3_mkt <= 42) or (s3_mkt >= 58 and s3_pm <= 42) or (s3_pm >= 70 and s3_mkt <= 50) or (s3_mkt >= 70 and s3_pm <= 50) %}
-        <div class="stage open" id="stage-{{ rk }}-3" style="border-color:{{ s3_col }}44">
-            <div class="stage-head" onclick="toggleStage('stage-{{ rk }}-3')">
-                <div style="display:flex;align-items:center">
-                    <span class="stage-icon">📈</span>
-                    <div>
-                        <div class="stage-title">STAGE 3 — MARKET POSITIONING</div>
-                        <div class="stage-desc">Informed money moving</div>
-                    </div>
-                </div>
-                <div style="display:flex;align-items:center;gap:10px">
-                    <span class="stage-status" style="color:{{ s3_col }};background:{{ s3_col }}18;border:1px solid {{ s3_col }}33">{{ s3_status }}{% if s3_diverging %} <span style="color:#c084fc" title="Signals within this stage are diverging">↕</span>{% endif %}</span>
-                    <span class="stage-arrow">▸</span>
-                </div>
-            </div>
-            <div class="stage-body">
-                <!-- Polymarket -->
-                <div class="sig" style="border-color:{{ rd.pm_colour }}33">
-                    <div class="sig-head">
-                        <div><div class="sig-name">Polymarket</div><div class="sig-src">Prediction Markets • Weight: 37.5%</div></div>
-                        <div class="sig-score" style="color:{{ rd.pm_colour }}">{{ s3_pm }}</div>
-                    </div>
-                    <div class="sig-detail">{{ rps.num_contracts }} contracts ({{ rps.threat_count }} threat, {{ rps.deesc_count }} de-esc) • {{ rps.mature_count }}/{{ rps.num_contracts }} mature</div>
-                    <div class="sig-detail">Avg risk: {{ rps.avg_risk_pct }}% • ${{ "{:,.0f}".format(rps.total_volume) }} vol{% if rps.agg_z is defined %} • z={{ rps.agg_z }}{% endif %}</div>
-                    <div class="bar" style="height:14px"><div class="bar-track" style="height:3px"></div><div class="bar-mid" style="height:8px"></div>
-                        <div class="bar-dot" style="left:{{ s3_pm }}%;background:{{ rd.pm_colour }};width:10px;height:10px"></div></div>
-                </div>
-                <!-- Financial Markets -->
-                <div class="sig" style="border-color:{{ rd.mkt_colour }}33">
-                    <div class="sig-head">
-                        <div><div class="sig-name">Financial Markets</div><div class="sig-src">yfinance • Weight: 37.5%</div></div>
-                        <div class="sig-score" style="color:{{ rd.mkt_colour }}">{{ s3_mkt }}</div>
-                    </div>
-                    <div class="sig-detail">{{ rd.mkt_tickers|length }} tickers • today vs 90-day baseline</div>
-                    <div class="bar" style="height:14px"><div class="bar-track" style="height:3px"></div><div class="bar-mid" style="height:8px"></div>
-                        <div class="bar-dot" style="left:{{ s3_mkt }}%;background:{{ rd.mkt_colour }};width:10px;height:10px"></div></div>
-                </div>
+<!-- S2 GROUND -->
+{% set gts=rd.gtrends_stats %}{% set s2s='ALERT' if rd.signals.gt_panic>=70 else ('ACTIVE' if rd.signals.gt_panic>=58 else 'QUIET') %}{% set s2c='#f87171' if s2s=='ALERT' else ('#fbbf24' if s2s=='ACTIVE' else '#555') %}
+<div class="stage {% if s2s!='QUIET' %}open{% endif %}" id="stage-{{ rk }}-2" style="border-color:{{ s2c }}44"><div class="stage-head" onclick="toggleStage('stage-{{ rk }}-2')"><div style="display:flex;align-items:center"><span class="stage-icon">📡</span><div><div class="stage-title">STAGE 2 — GROUND SIGNAL</div><div class="stage-desc">Local populations and early observers reacting</div></div></div><div style="display:flex;align-items:center;gap:10px"><span class="stage-status" style="color:{{ s2c }};background:{{ s2c }}18;border:1px solid {{ s2c }}33">{{ s2s }}</span><span class="stage-arrow">▸</span></div></div>
+<div class="stage-body"><div class="sig" style="border-color:{{ rd.gt_panic_colour }}33"><div class="sig-head"><div><div class="sig-name">Panic Search Trends</div><div class="sig-src">Google Trends • Weight: 25%</div></div><div class="sig-score" style="color:{{ rd.gt_panic_colour }}">{{ rd.signals.gt_panic }}</div></div>
+{% if gts and gts.l2_count is defined and gts.l2_count>0 %}<div class="sig-detail">Panic terms z={{ gts.layer2_z }} ({{ gts.l2_count }}/{{ gtrends_expected.get(rk,{}).get('l2','?') }})</div>{% if gts.panic_alerts %}{% for alert in gts.panic_alerts %}<div class="sig-alert">🔴 {{ alert.term }}: z={{ alert.z }}</div>{% endfor %}{% endif %}{% elif gtrends_fetching and not gtrends_regional %}<div class="sig-detail" style="color:#fbbf24">⏳ Fetching panic search data...</div>{% else %}<div class="sig-detail" style="color:#666">Waiting for first fetch cycle</div>{% endif %}
+<div class="bar" style="height:14px"><div class="bar-track" style="height:3px"></div><div class="bar-mid" style="height:8px"></div><div class="bar-dot" style="left:{{ rd.signals.gt_panic }}%;background:{{ rd.gt_panic_colour }};width:10px;height:10px"></div></div></div>
+{% if gts and gts.layer2_terms is defined and gts.layer2_terms %}<div class="dd" id="dd-{{ rk }}-panic"><div class="dd-toggle" onclick="toggleDD('dd-{{ rk }}-panic')">Panic Terms — {{ gts.l2_count }}/{{ gtrends_expected.get(rk,{}).get('l2','?') }} succeeded <span class="dd-arrow">▸</span></div><div class="dd-body">{% set ns=namespace(shown=0) %}{% for t in gts.layer2_terms %}{% if t.z|abs>0.3 %}{% set ns.shown=ns.shown+1 %}<div class="trow"><div><div class="trow-name">{% if t.z>1.5 %}🔴 {% endif %}{{ t.term }}</div><div class="trow-sub">panic indicator</div></div><div class="trow-z" style="color:{% if t.z>1.5 %}#f87171{% elif t.z>0.5 %}#ef4444{% elif t.z<-0.5 %}#22c55e{% else %}#888{% endif %}">z={{ t.z }}</div></div>{% endif %}{% endfor %}{% if ns.shown==0 %}<div style="font-size:.7em;color:#555;padding:8px 0">All {{ gts.l2_count }} terms within normal range (|z| < 0.3)</div>{% elif ns.shown<gts.l2_count %}<div style="font-size:.7em;color:#555;padding:8px 0">{{ gts.l2_count-ns.shown }} more term{{ 's' if gts.l2_count-ns.shown!=1 }} within normal range</div>{% endif %}</div></div>{% endif %}
+                {% if rh and rh|length>1 %}<div style="margin-top:8px"><div class="graph-ctrl">
+                    <label class="graph-tgl"><input type="checkbox" id="tgl-{{ rk }}-s2-score" checked onchange="drawStageChart('{{ rk }}','s2')"><span class="tgl-sw" style="background:#eab308"></span> Composite</label>
+                    <label class="graph-tgl"><input type="checkbox" id="tgl-{{ rk }}-s2-gt_panic" checked onchange="drawStageChart('{{ rk }}','s2')"><span class="tgl-sw" style="background:#f97316"></span> Panic Search Trends</label>
+                    <div style="margin-left:auto;display:flex;gap:4px"><button class="tf-btn active" onclick="setRTFStage('{{ rk }}','s2','48h',this)">48h</button><button class="tf-btn" onclick="setRTFStage('{{ rk }}','s2','1w',this)">1W</button><button class="tf-btn" onclick="setRTFStage('{{ rk }}','s2','1m',this)">1M</button><button class="tf-btn" onclick="setRTFStage('{{ rk }}','s2','all',this)">All</button></div>
+                </div><div style="width:100%;height:200px;position:relative"><canvas id="chart-{{ rk }}-s2"></canvas></div></div>{% endif %}
+            </div></div>
 
-                <!-- Contract List -->
-                {% set reg_contracts = regional_contracts.get(rk, []) %}
-                {% if reg_contracts %}
-                <div class="dd" id="dd-{{ rk }}-contracts">
-                    <div class="dd-toggle" onclick="toggleDD('dd-{{ rk }}-contracts')">{{ regions[rk].name }} Contracts — {{ reg_contracts|length }} tracked <span class="dd-arrow">▸</span></div>
-                    <div class="dd-body">
-                        <div class="trow" style="border-bottom:2px solid #1a1a2e;padding-bottom:4px;margin-bottom:4px">
-                            <div><span class="col-header">Contract</span></div>
-                            <div class="trow-stats"><div class="trow-spark"><span class="col-header">48h</span></div><div class="trow-val"><span class="col-header" style="font-weight:400">Odds</span></div><div class="trow-change"><span class="col-header" style="font-weight:400">24h Δ</span></div><div class="trow-z"><span class="col-header">Z</span></div><div class="trow-wt"><span class="col-header">Weight</span></div></div>
-                        </div>
-                        {% for c in reg_contracts %}
-                        <div class="trow{% if not c.is_mature %} trow-immature{% endif %}">
-                            <div style="flex:1;min-width:0"><div style="font-size:0.82em;color:#eee;line-height:1.4;padding-right:10px">{{ c.question }}
-                                {% if c.is_deescalation %}<span class="badge badge-deesc">DE-ESC</span>{% else %}<span class="badge badge-threat">THREAT</span>{% endif %}
-                                {% if c.is_mature %}<span class="badge badge-mature">MATURE ({{ c.dp_count }})</span>{% else %}<span class="badge badge-immature">IMMATURE ({{ c.dp_count }})</span>{% endif %}
-                            </div></div>
-                            <div class="trow-stats">
-                                <div class="trow-spark">{{ c.sparkline_svg|safe }}</div>
-                                <div class="trow-val" style="color:{{ c.colour }}">{{ c.probability_pct }}%</div>
-                                {% if c.change_24h is not none %}<div class="trow-change" style="color:{{ c.change_colour }}">{% if c.change_24h > 0 %}+{% endif %}{{ c.change_24h }}pp</div>{% else %}<div class="trow-change" style="color:#333">—</div>{% endif %}
-                                {% if c.z_score is not none %}<div class="trow-z">{{ c.z_score }}</div>{% else %}<div class="trow-z" style="color:#333">—</div>{% endif %}
-                                {% if c.contrib_pct is not none %}<div class="trow-wt" style="color:{% if c.contrib_dir == 'up' %}#f97316{% elif c.contrib_dir == 'down' %}#22c55e{% else %}#555{% endif %}">{{ c.contrib_pct }}%{% if c.contrib_dir == 'up' %}↑{% elif c.contrib_dir == 'down' %}↓{% endif %}</div>{% else %}<div class="trow-wt" style="color:#333">—</div>{% endif %}
-                            </div>
-                        </div>
-                        {% endfor %}
-                    </div>
-                </div>
-                {% endif %}
+<!-- S3 MARKETS -->
+{% set rps=rd.pm_stats %}{% set s3pm=rd.signals.polymarket %}{% set s3mkt=rd.signals.markets %}{% set s3s='ALERT' if s3pm>=70 or s3mkt>=70 else ('ACTIVE' if s3pm>=58 or s3mkt>=58 else 'QUIET') %}{% set s3c='#f87171' if s3s=='ALERT' else ('#fbbf24' if s3s=='ACTIVE' else '#555') %}{% set s3div=(s3pm>=58 and s3mkt<=42) or (s3mkt>=58 and s3pm<=42) or (s3pm>=70 and s3mkt<=50) or (s3mkt>=70 and s3pm<=50) %}
+<div class="stage open" id="stage-{{ rk }}-3" style="border-color:{{ s3c }}44"><div class="stage-head" onclick="toggleStage('stage-{{ rk }}-3')"><div style="display:flex;align-items:center"><span class="stage-icon">📈</span><div><div class="stage-title">STAGE 3 — MARKET POSITIONING</div><div class="stage-desc">Informed money moving</div></div></div><div style="display:flex;align-items:center;gap:10px"><span class="stage-status" style="color:{{ s3c }};background:{{ s3c }}18;border:1px solid {{ s3c }}33">{{ s3s }}{% if s3div %} <span style="color:#c084fc" title="Signals within this stage are diverging">↕</span>{% endif %}</span><span class="stage-arrow">▸</span></div></div>
+<div class="stage-body">
+<div class="sig" style="border-color:{{ rd.pm_colour }}33"><div class="sig-head"><div><div class="sig-name">Polymarket</div><div class="sig-src">Prediction Markets • Weight: 37.5%</div></div><div class="sig-score" style="color:{{ rd.pm_colour }}">{{ s3pm }}</div></div><div class="sig-detail">{{ rps.num_contracts }} contracts ({{ rps.threat_count }} threat, {{ rps.deesc_count }} de-esc) • {{ rps.mature_count }}/{{ rps.num_contracts }} mature</div><div class="sig-detail">Avg risk: {{ rps.avg_risk_pct }}% • ${{ "{:,.0f}".format(rps.total_volume) }} vol{% if rps.agg_z is defined %} • z={{ rps.agg_z }}{% endif %}</div><div class="bar" style="height:14px"><div class="bar-track" style="height:3px"></div><div class="bar-mid" style="height:8px"></div><div class="bar-dot" style="left:{{ s3pm }}%;background:{{ rd.pm_colour }};width:10px;height:10px"></div></div></div>
+<div class="sig" style="border-color:{{ rd.mkt_colour }}33"><div class="sig-head"><div><div class="sig-name">Financial Markets</div><div class="sig-src">yfinance • Weight: 37.5%</div></div><div class="sig-score" style="color:{{ rd.mkt_colour }}">{{ s3mkt }}</div></div><div class="sig-detail">{{ rd.mkt_tickers|length }} tickers • today vs 90-day baseline</div><div class="bar" style="height:14px"><div class="bar-track" style="height:3px"></div><div class="bar-mid" style="height:8px"></div><div class="bar-dot" style="left:{{ s3mkt }}%;background:{{ rd.mkt_colour }};width:10px;height:10px"></div></div></div>
 
-                <!-- Ticker List -->
-                {% if rd.mkt_tickers %}
-                <div class="dd" id="dd-{{ rk }}-tickers">
-                    <div class="dd-toggle" onclick="toggleDD('dd-{{ rk }}-tickers')">Financial Tickers — {{ rd.mkt_tickers|length }} tracked <span class="dd-arrow">▸</span></div>
-                    <div class="dd-body">
-                        {% for tk in rd.mkt_tickers %}{% if tk in market_data and market_data[tk].error is not defined %}{% set d = market_data[tk] %}
-                        <div class="trow">
-                            <div><div class="trow-name">{{ d.name }}{% if d.inverted %} <span style="font-size:0.6em;color:#f97316">▼INV</span>{% endif %}{% if d.region == 'global' %} <span style="font-size:0.6em;color:#666">⊕</span>{% endif %}</div><div class="trow-sub">{{ tk }} • {{ d.type }}</div></div>
-                            <div class="trow-stats">
-                                <div class="trow-spark">{{ d.sparkline_svg|safe }}</div>
-                                <div style="font-size:0.8em;color:#bbb">{{ d.current_price }}</div>
-                                <div class="trow-change" style="color:{{ d.change_colour }}">{% if d.daily_change_pct > 0 %}+{% endif %}{{ d.daily_change_pct }}%</div>
-                                <div class="trow-z">z={{ d.z_score }}</div>
-                            </div>
-                        </div>
-                        {% endif %}{% endfor %}
-                    </div>
-                </div>
-                {% endif %}
-            </div>
-        </div>
+{% set reg_contracts=regional_contracts.get(rk,[]) %}{% if reg_contracts %}<div class="dd" id="dd-{{ rk }}-contracts"><div class="dd-toggle" onclick="toggleDD('dd-{{ rk }}-contracts')">{{ regions[rk].name }} Contracts — {{ reg_contracts|length }} tracked <span class="dd-arrow">▸</span></div><div class="dd-body">
+<div class="trow" style="border-bottom:2px solid #1a1a2e;padding-bottom:4px;margin-bottom:4px"><div><span class="col-header">Contract</span></div><div class="trow-stats"><div class="trow-spark"><span class="col-header">48h</span></div><div class="trow-val"><span class="col-header" style="font-weight:400">Odds</span></div><div class="trow-change"><span class="col-header" style="font-weight:400">24h Δ</span></div><div class="trow-z"><span class="col-header">Z</span></div><div class="trow-wt"><span class="col-header">Weight</span></div></div></div>
+{% for c in reg_contracts %}<div class="trow{% if not c.is_mature %} trow-immature{% endif %}"><div style="flex:1;min-width:0"><div style="font-size:.82em;color:#eee;line-height:1.4;padding-right:10px">{{ c.question }}{% if c.is_deescalation %}<span class="badge badge-deesc">DE-ESC</span>{% else %}<span class="badge badge-threat">THREAT</span>{% endif %}{% if not c.is_mature %}<span class="badge badge-immature">IMMATURE</span>{% endif %}{% if c.is_new %}<span class="badge" style="background:#1a2a1a;color:#fbbf24">NEW</span>{% endif %}</div></div><div class="trow-stats"><div class="trow-spark">{{ c.sparkline_svg|safe }}</div><div class="trow-val" style="color:{{ c.colour }}">{{ c.probability_pct }}%</div>{% if c.change_24h is not none %}<div class="trow-change" style="color:{{ c.change_colour }}">{% if c.change_24h>0 %}+{% endif %}{{ c.change_24h }}pp</div>{% else %}<div class="trow-change" style="color:#333">—</div>{% endif %}{% if c.z_score is not none %}<div class="trow-z">{{ c.z_score }}</div>{% else %}<div class="trow-z" style="color:#333">—</div>{% endif %}{% if c.contrib_pct is not none %}<div class="trow-wt" style="color:{% if c.contrib_dir=='up' %}#f97316{% elif c.contrib_dir=='down' %}#22c55e{% else %}#555{% endif %}">{{ c.contrib_pct }}%{% if c.contrib_dir=='up' %}↑{% elif c.contrib_dir=='down' %}↓{% endif %}</div>{% else %}<div class="trow-wt" style="color:#333">—</div>{% endif %}</div></div>{% endfor %}</div></div>{% endif %}
 
-        <!-- STAGE 4 — NARRATIVE FORMATION -->
-        {% set gs = rd.gdelt_stats %}
-        {% set gts2 = rd.gtrends_stats %}
-        {% set s4_status = 'ALERT' if rd.signals.gdelt >= 70 or rd.signals.gt_global >= 70 else ('ACTIVE' if rd.signals.gdelt >= 58 or rd.signals.gt_global >= 58 else 'QUIET') %}
-        {% set s4_col = '#f87171' if s4_status == 'ALERT' else ('#fbbf24' if s4_status == 'ACTIVE' else '#555') %}
-        {% set s4_diverging = (rd.signals.gdelt >= 58 and rd.signals.gt_global <= 42) or (rd.signals.gt_global >= 58 and rd.signals.gdelt <= 42) or (rd.signals.gdelt >= 70 and rd.signals.gt_global <= 50) or (rd.signals.gt_global >= 70 and rd.signals.gdelt <= 50) %}
-        <div class="stage {% if s4_status != 'QUIET' %}open{% endif %}" id="stage-{{ rk }}-4" style="border-color:{{ s4_col }}44">
-            <div class="stage-head" onclick="toggleStage('stage-{{ rk }}-4')">
-                <div style="display:flex;align-items:center">
-                    <span class="stage-icon">📰</span>
-                    <div>
-                        <div class="stage-title">STAGE 4 — NARRATIVE FORMATION</div>
-                        <div class="stage-desc">Media and global public catching up</div>
-                    </div>
-                </div>
-                <div style="display:flex;align-items:center;gap:10px">
-                    <span class="stage-status" style="color:{{ s4_col }};background:{{ s4_col }}18;border:1px solid {{ s4_col }}33">{{ s4_status }}{% if s4_diverging %} <span style="color:#c084fc" title="Signals within this stage are diverging">↕</span>{% endif %}</span>
-                    <span class="stage-arrow">▸</span>
-                </div>
-            </div>
-            <div class="stage-body">
-                <div class="sig" style="border-color:{{ rd.gdelt_colour }}33">
-                    <div class="sig-head">
-                        <div><div class="sig-name">GDELT News Tone</div><div class="sig-src">BigQuery • Context Only — Not Scored</div></div>
-                        <div class="sig-score" style="color:{{ rd.gdelt_colour }}">{{ rd.signals.gdelt }}</div>
-                    </div>
-                    {% if gs and gs.recent_tone is defined %}
-                    <div class="sig-detail">72h tone: {{ gs.recent_tone }} vs 30d: {{ gs.baseline_tone }} • Tone z={{ gs.z_score }} • Vol z={{ gs.vol_z }}</div>
-                    <div class="sig-detail" style="color:#555">{{ gs.recent_articles|default(0) }} recent / {{ gs.baseline_articles|default(0) }} baseline • {{ gs.source|default('API') }}</div>
-                    {% elif gdelt_fetching %}<div class="sig-detail" style="color:#fbbf24">⏳ Fetching GDELT data...</div>
-                    {% elif gs and gs.error is defined %}<div class="sig-detail" style="color:#ef4444">{{ gs.error }}</div>
-                    {% endif %}
-                    <div class="bar" style="height:14px"><div class="bar-track" style="height:3px"></div><div class="bar-mid" style="height:8px"></div>
-                        <div class="bar-dot" style="left:{{ rd.signals.gdelt }}%;background:{{ rd.gdelt_colour }};width:10px;height:10px"></div></div>
-                </div>
-                <div class="sig" style="border-color:{{ rd.gt_global_colour }}33">
-                    <div class="sig-head">
-                        <div><div class="sig-name">Global Search Trends</div><div class="sig-src">Google Trends • Context Only — Not Scored</div></div>
-                        <div class="sig-score" style="color:{{ rd.gt_global_colour }}">{{ rd.signals.gt_global }}</div>
-                    </div>
-                    {% if gts2 and gts2.l1_count is defined %}
-                    <div class="sig-detail">Global terms z={{ gts2.layer1_z }} ({{ gts2.l1_count }}/{{ gtrends_expected.get(rk, {}).get('l1', '?') }})</div>
-                    {% elif gtrends_fetching %}<div class="sig-detail" style="color:#fbbf24">⏳ Fetching global search data...</div>
-                    {% else %}<div class="sig-detail" style="color:#666">Waiting for first fetch cycle</div>{% endif %}
-                    <div class="bar" style="height:14px"><div class="bar-track" style="height:3px"></div><div class="bar-mid" style="height:8px"></div>
-                        <div class="bar-dot" style="left:{{ rd.signals.gt_global }}%;background:{{ rd.gt_global_colour }};width:10px;height:10px"></div></div>
-                </div>
+{% if rd.mkt_tickers %}<div class="dd" id="dd-{{ rk }}-tickers"><div class="dd-toggle" onclick="toggleDD('dd-{{ rk }}-tickers')">Financial Tickers — {{ rd.mkt_tickers|length }} tracked <span class="dd-arrow">▸</span></div><div class="dd-body">{% for tk in rd.mkt_tickers %}{% if tk in market_data and market_data[tk].error is not defined %}{% set d=market_data[tk] %}<div class="trow"><div><div class="trow-name">{{ d.name }}{% if d.inverted %} <span style="font-size:.6em;color:#f97316">▼INV</span>{% endif %}{% if d.region=='global' %} <span style="font-size:.6em;color:#666">⊕</span>{% endif %}</div><div class="trow-sub">{{ tk }} • {{ d.type }}</div></div><div class="trow-stats"><div class="trow-spark">{{ d.sparkline_svg|safe }}</div><div style="font-size:.8em;color:#bbb">{{ d.current_price }}</div><div class="trow-change" style="color:{{ d.change_colour }}">{% if d.daily_change_pct>0 %}+{% endif %}{{ d.daily_change_pct }}%</div><div class="trow-z">z={{ d.z_score }}</div></div></div>{% endif %}{% endfor %}</div></div>{% endif %}
+                {% if rh and rh|length>1 %}<div style="margin-top:8px"><div class="graph-ctrl">
+                    <label class="graph-tgl"><input type="checkbox" id="tgl-{{ rk }}-s3-score" checked onchange="drawStageChart('{{ rk }}','s3')"><span class="tgl-sw" style="background:#eab308"></span> Composite</label>
+                    <label class="graph-tgl"><input type="checkbox" id="tgl-{{ rk }}-s3-pm" checked onchange="drawStageChart('{{ rk }}','s3')"><span class="tgl-sw" style="background:#3b82f6"></span> Polymarket</label>
+                    <label class="graph-tgl"><input type="checkbox" id="tgl-{{ rk }}-s3-mkt" checked onchange="drawStageChart('{{ rk }}','s3')"><span class="tgl-sw" style="background:#8b5cf6"></span> Financial Markets</label>
+                    <div style="margin-left:auto;display:flex;gap:4px"><button class="tf-btn active" onclick="setRTFStage('{{ rk }}','s3','48h',this)">48h</button><button class="tf-btn" onclick="setRTFStage('{{ rk }}','s3','1w',this)">1W</button><button class="tf-btn" onclick="setRTFStage('{{ rk }}','s3','1m',this)">1M</button><button class="tf-btn" onclick="setRTFStage('{{ rk }}','s3','all',this)">All</button></div>
+                </div><div style="width:100%;height:200px;position:relative"><canvas id="chart-{{ rk }}-s3"></canvas></div></div>{% endif %}
+</div></div>
 
-                <!-- Global Terms Detail -->
-                {% if gts2 and gts2.layer1_terms is defined and gts2.layer1_terms %}
-                <div class="dd" id="dd-{{ rk }}-global-terms">
-                    <div class="dd-toggle" onclick="toggleDD('dd-{{ rk }}-global-terms')">Global Terms — {{ gts2.l1_count }}/{{ gtrends_expected.get(rk, {}).get('l1', '?') }} <span class="dd-arrow">▸</span></div>
-                    <div class="dd-body">
-                        {% set ns = namespace(shown=0) %}
-                        {% for t in gts2.layer1_terms %}{% if t.z|abs > 0.3 %}{% set ns.shown = ns.shown + 1 %}
-                        <div class="trow">
-                            <div><div class="trow-name">{{ t.term }}</div><div class="trow-sub">worldwide • conflict term</div></div>
-                            <div class="trow-z" style="color:{% if t.z > 0.5 %}#ef4444{% elif t.z < -0.5 %}#22c55e{% else %}#888{% endif %}">z={{ t.z }}</div>
-                        </div>
-                        {% endif %}{% endfor %}
-                        {% if ns.shown == 0 %}<div style="font-size:0.7em;color:#555;padding:8px 0">All {{ gts2.l1_count }} terms within normal range (|z| < 0.3)</div>
-                        {% elif ns.shown < gts2.l1_count %}<div style="font-size:0.7em;color:#555;padding:8px 0">{{ gts2.l1_count - ns.shown }} more term{{ 's' if gts2.l1_count - ns.shown != 1 }} within normal range</div>{% endif %}
-                    </div>
-                </div>
-                {% endif %}
-            </div>
-        </div>
+<!-- S4 NARRATIVE -->
+{% set gs=rd.gdelt_stats %}{% set gts2=rd.gtrends_stats %}{% set s4s='ALERT' if rd.signals.gdelt>=70 or rd.signals.gt_global>=70 else ('ACTIVE' if rd.signals.gdelt>=58 or rd.signals.gt_global>=58 else 'QUIET') %}{% set s4c='#f87171' if s4s=='ALERT' else ('#fbbf24' if s4s=='ACTIVE' else '#555') %}{% set s4div=(rd.signals.gdelt>=58 and rd.signals.gt_global<=42) or (rd.signals.gt_global>=58 and rd.signals.gdelt<=42) or (rd.signals.gdelt>=70 and rd.signals.gt_global<=50) or (rd.signals.gt_global>=70 and rd.signals.gdelt<=50) %}
+<div class="stage {% if s4s!='QUIET' %}open{% endif %}" id="stage-{{ rk }}-4" style="border-color:{{ s4c }}44"><div class="stage-head" onclick="toggleStage('stage-{{ rk }}-4')"><div style="display:flex;align-items:center"><span class="stage-icon">📰</span><div><div class="stage-title">STAGE 4 — NARRATIVE FORMATION</div><div class="stage-desc">Media and global public catching up</div></div></div><div style="display:flex;align-items:center;gap:10px"><span class="stage-status" style="color:{{ s4c }};background:{{ s4c }}18;border:1px solid {{ s4c }}33">{{ s4s }}{% if s4div %} <span style="color:#c084fc" title="Signals within this stage are diverging">↕</span>{% endif %}</span><span class="stage-arrow">▸</span></div></div>
+<div class="stage-body">
+<div class="sig" style="border-color:{{ rd.gdelt_colour }}33"><div class="sig-head"><div><div class="sig-name">GDELT News Tone</div><div class="sig-src">BigQuery • Context Only — Not Scored</div></div><div class="sig-score" style="color:{{ rd.gdelt_colour }}">{{ rd.signals.gdelt }}</div></div>{% if gs and gs.recent_tone is defined %}<div class="sig-detail">72h tone: {{ gs.recent_tone }} vs 30d: {{ gs.baseline_tone }} • Tone z={{ gs.z_score }} • Vol z={{ gs.vol_z }}</div><div class="sig-detail" style="color:#555">{{ gs.recent_articles|default(0) }} recent / {{ gs.baseline_articles|default(0) }} baseline • {{ gs.source|default('API') }}</div>{% elif gdelt_fetching %}<div class="sig-detail" style="color:#fbbf24">⏳ Fetching GDELT data...</div>{% elif gs and gs.error is defined %}<div class="sig-detail" style="color:#ef4444">{{ gs.error }}</div>{% endif %}<div class="bar" style="height:14px"><div class="bar-track" style="height:3px"></div><div class="bar-mid" style="height:8px"></div><div class="bar-dot" style="left:{{ rd.signals.gdelt }}%;background:{{ rd.gdelt_colour }};width:10px;height:10px"></div></div></div>
+<div class="sig" style="border-color:{{ rd.gt_global_colour }}33"><div class="sig-head"><div><div class="sig-name">Global Search Trends</div><div class="sig-src">Google Trends • Context Only — Not Scored</div></div><div class="sig-score" style="color:{{ rd.gt_global_colour }}">{{ rd.signals.gt_global }}</div></div>{% if gts2 and gts2.l1_count is defined %}<div class="sig-detail">Global terms z={{ gts2.layer1_z }} ({{ gts2.l1_count }}/{{ gtrends_expected.get(rk,{}).get('l1','?') }})</div>{% elif gtrends_fetching %}<div class="sig-detail" style="color:#fbbf24">⏳ Fetching global search data...</div>{% else %}<div class="sig-detail" style="color:#666">Waiting for first fetch cycle</div>{% endif %}<div class="bar" style="height:14px"><div class="bar-track" style="height:3px"></div><div class="bar-mid" style="height:8px"></div><div class="bar-dot" style="left:{{ rd.signals.gt_global }}%;background:{{ rd.gt_global_colour }};width:10px;height:10px"></div></div></div>
+{% if gts2 and gts2.layer1_terms is defined and gts2.layer1_terms %}<div class="dd" id="dd-{{ rk }}-global-terms"><div class="dd-toggle" onclick="toggleDD('dd-{{ rk }}-global-terms')">Global Terms — {{ gts2.l1_count }}/{{ gtrends_expected.get(rk,{}).get('l1','?') }} <span class="dd-arrow">▸</span></div><div class="dd-body">{% set ns=namespace(shown=0) %}{% for t in gts2.layer1_terms %}{% if t.z|abs>0.3 %}{% set ns.shown=ns.shown+1 %}<div class="trow"><div><div class="trow-name">{{ t.term }}</div><div class="trow-sub">worldwide • conflict term</div></div><div class="trow-z" style="color:{% if t.z>0.5 %}#ef4444{% elif t.z<-0.5 %}#22c55e{% else %}#888{% endif %}">z={{ t.z }}</div></div>{% endif %}{% endfor %}{% if ns.shown==0 %}<div style="font-size:.7em;color:#555;padding:8px 0">All {{ gts2.l1_count }} terms within normal range (|z| < 0.3)</div>{% elif ns.shown<gts2.l1_count %}<div style="font-size:.7em;color:#555;padding:8px 0">{{ gts2.l1_count-ns.shown }} more term{{ 's' if gts2.l1_count-ns.shown!=1 }} within normal range</div>{% endif %}</div></div>{% endif %}
+                {% if rh and rh|length>1 %}<div style="margin-top:8px"><div class="graph-ctrl">
+                    <label class="graph-tgl"><input type="checkbox" id="tgl-{{ rk }}-s4-score" checked onchange="drawStageChart('{{ rk }}','s4')"><span class="tgl-sw" style="background:#eab308"></span> Composite</label>
+                    <label class="graph-tgl"><input type="checkbox" id="tgl-{{ rk }}-s4-gdelt" checked onchange="drawStageChart('{{ rk }}','s4')"><span class="tgl-sw" style="background:#22c55e"></span> GDELT</label>
+                    <label class="graph-tgl"><input type="checkbox" id="tgl-{{ rk }}-s4-gt_global" checked onchange="drawStageChart('{{ rk }}','s4')"><span class="tgl-sw" style="background:#ef4444"></span> Global Search Trends</label>
+                    <div style="margin-left:auto;display:flex;gap:4px"><button class="tf-btn active" onclick="setRTFStage('{{ rk }}','s4','48h',this)">48h</button><button class="tf-btn" onclick="setRTFStage('{{ rk }}','s4','1w',this)">1W</button><button class="tf-btn" onclick="setRTFStage('{{ rk }}','s4','1m',this)">1M</button><button class="tf-btn" onclick="setRTFStage('{{ rk }}','s4','all',this)">All</button></div>
+                </div><div style="width:100%;height:200px;position:relative"><canvas id="chart-{{ rk }}-s4"></canvas></div></div>{% endif %}
+</div></div>
 
-        <!-- SUPPLEMENTAL -->
-        {% set racled = acled_regional.get(rk, {}) %}
-        {% if racled and racled.top_countries is defined and racled.top_countries %}
-        <div class="supp" id="dd-{{ rk }}-acled">
-            <div class="supp-head" onclick="toggleDD('dd-{{ rk }}-acled')">
-                <div style="display:flex;align-items:center;gap:10px">
-                    <span>📋</span>
-                    <span style="font-size:0.65em;font-weight:700;color:#888;letter-spacing:1.5px">ACLED FORECAST — {{ regions[rk].name|upper }}</span>
-                    <span class="supp-badge">SUPPLEMENTAL</span>
-                </div>
-                <span class="dd-arrow">▸</span>
-            </div>
-            <div class="dd-body">
-                {% for cn, ct in racled.top_countries %}
-                <div class="trow"><div class="trow-name">{{ cn }} <span style="font-size:0.7em;color:#666;margin-left:6px">⚔{{ ct.battles }} 💥{{ ct.erv }} 👤{{ ct.vac }}</span></div>
-                    <div style="font-size:0.85em;font-weight:600;color:#f97316">{{ "{:,}".format(ct.total) }}</div></div>
-                {% endfor %}
-            </div>
-        </div>
-        {% endif %}
+<!-- SUPPLEMENTAL -->
+{% set racled=acled_regional.get(rk,{}) %}{% if racled and racled.top_countries is defined and racled.top_countries %}<div class="supp" id="dd-{{ rk }}-acled"><div class="supp-head" onclick="toggleDD('dd-{{ rk }}-acled')"><div style="display:flex;align-items:center;gap:10px"><span>📋</span><span style="font-size:.65em;font-weight:700;color:#888;letter-spacing:1.5px">ACLED FORECAST — {{ regions[rk].name|upper }}</span><span class="supp-badge">SUPPLEMENTAL</span></div><span class="dd-arrow">▸</span></div><div class="dd-body">{% for cn,ct in racled.top_countries %}<div class="trow"><div class="trow-name">{{ cn }} <span style="font-size:.7em;color:#666;margin-left:6px">⚔{{ ct.battles }} 💥{{ ct.erv }} 👤{{ ct.vac }}</span></div><div style="font-size:.85em;font-weight:600;color:#f97316">{{ "{:,}".format(ct.total) }}</div></div>{% endfor %}</div></div>{% endif %}
 
-        <!-- Regional Score History -->
-        {% set rh = regional_history.get(rk, []) %}
-        {% if rh and rh|length > 1 %}
-        <div class="dd open" id="dd-{{ rk }}-history">
-            <div class="dd-toggle" onclick="toggleDD('dd-{{ rk }}-history')">Score History ({{ rh|length }} snapshots) <span class="dd-arrow">▸</span></div>
-            <div class="dd-body">
-                <div class="graph-ctrl">
-                    <label class="graph-tgl"><input type="checkbox" id="tgl-{{ rk }}-comp" checked onchange="drawRC('{{ rk }}')"><span class="tgl-sw" style="background:{{ rd.fixed_colour }}"></span> Composite</label>
-                    <label class="graph-tgl"><input type="checkbox" id="tgl-{{ rk }}-pm" onchange="drawRC('{{ rk }}')"><span class="tgl-sw" style="background:#3b82f6"></span> PM</label>
-                    <label class="graph-tgl"><input type="checkbox" id="tgl-{{ rk }}-mkt" onchange="drawRC('{{ rk }}')"><span class="tgl-sw" style="background:#8b5cf6"></span> Mkt</label>
-                    <label class="graph-tgl"><input type="checkbox" id="tgl-{{ rk }}-gdelt" onchange="drawRC('{{ rk }}')"><span class="tgl-sw" style="background:#22c55e"></span> GDELT</label>
-                    <label class="graph-tgl"><input type="checkbox" id="tgl-{{ rk }}-panic" onchange="drawRC('{{ rk }}')"><span class="tgl-sw" style="background:#f97316"></span> Panic</label>
-                    <label class="graph-tgl"><input type="checkbox" id="tgl-{{ rk }}-cf" onchange="drawRC('{{ rk }}')"><span class="tgl-sw" style="background:#06b6d4"></span> Internet</label>
-                </div>
-                <div style="display:flex;gap:6px;margin-bottom:10px">
-                    <button class="tf-btn active" onclick="setRTF('{{ rk }}','48h')">48h</button>
-                    <button class="tf-btn" onclick="setRTF('{{ rk }}','1w')">1W</button>
-                    <button class="tf-btn" onclick="setRTF('{{ rk }}','1m')">1M</button>
-                    <button class="tf-btn" onclick="setRTF('{{ rk }}','all')">All</button>
-                </div>
-                <div style="width:100%;height:180px;position:relative"><canvas id="chart-{{ rk }}"></canvas></div>
-            </div>
-        </div>
-        {% endif %}
-    </div>
-    {% endfor %}
+</div>
+{% endfor %}
 
-    <a class="meth-link" href="#" onclick="document.getElementById('methodology').style.display=document.getElementById('methodology').style.display==='none'?'block':'none';return false;">▸ METHODOLOGY</a>
-    <div id="methodology" style="display:none;background:#0a0a12;border:1px solid #1a1a2e;border-radius:12px;padding:20px;margin-bottom:16px;font-size:0.75em;color:#888;line-height:1.7">
+<a class="meth-link" href="#" onclick="document.getElementById('methodology').style.display=document.getElementById('methodology').style.display==='none'?'block':'none';return false;">▸ METHODOLOGY</a>
+<div id="methodology" style="display:none;background:#0a0a12;border:1px solid #1a1a2e;border-radius:12px;padding:20px;margin-bottom:16px;font-size:.75em;color:#888;line-height:1.7">
 
-        <p style="color:#ccc;margin-bottom:16px">This dashboard measures how unusual current geopolitical conditions are compared to recent history. It does not predict whether specific events will happen — it detects when multiple independent systems are showing unusual activity simultaneously. A score of 50 means "normal." Higher means conditions are more tense than usual; lower means calmer than usual.</p>
+<p style="color:#ccc;margin-bottom:16px">This dashboard measures how unusual current geopolitical conditions are compared to recent history. It does not predict whether specific events will happen — it detects when multiple independent systems are showing unusual activity simultaneously. A score of 50 means "normal." Higher means conditions are more tense than usual; lower means calmer than usual.</p>
 
-        <p style="color:#eee;font-weight:700;font-size:1.1em;margin-bottom:8px;letter-spacing:1px">🔗 THE INFORMATION FLOW CHAIN</p>
-        <p style="margin-bottom:8px">The dashboard is organised around how geopolitical information typically propagates through different systems. During a developing crisis, signals tend to activate in a predictable sequence:</p>
-        <p style="margin-bottom:4px"><strong style="color:#eee">Stage 1 — Physical Observable:</strong> Infrastructure disruptions detectable before anyone reports them. Internet connectivity drops, flight corridors empty, power grids go dark. These are the earliest possible signals — they happen in the physical world before human reporting catches up.</p>
-        <p style="margin-bottom:4px"><strong style="color:#eee">Stage 2 — Ground Signal:</strong> Local populations and early observers react. People in affected countries search for "bomb shelter," "evacuation," and "VPN." OSINT accounts begin posting. This is the first human-generated signal layer.</p>
-        <p style="margin-bottom:4px"><strong style="color:#eee">Stage 3 — Market Positioning:</strong> Informed money moves. Prediction market contracts shift as traders with information or analytical edge reposition. Defence stocks rise, regional currencies weaken, commodity prices adjust.</p>
-        <p style="margin-bottom:8px"><strong style="color:#eee">Stage 4 — Narrative Formation:</strong> Media and the global public catch up. News tone shifts across thousands of articles. Worldwide search interest spikes as the broader public seeks information about the crisis.</p>
-        <p style="margin-bottom:16px">The composite score is derived from <strong style="color:#eee">Stage 2 and Stage 3 signals only</strong> — these are the signals most likely to move early and most directly connected to geopolitical events. Stage 1 (Cloudflare internet connectivity) is shown as a separate early warning indicator because internet traffic patterns are influenced by non-geopolitical factors (religious observances, weekends, seasonal patterns) that inject noise into baseline scoring. Stage 4 (GDELT news tone, global search trends) is shown as context because these signals lag during early escalation — during a rapidly developing crisis, waiting for media narrative to shift actively suppresses the composite when earlier stages have already detected genuine signals. When signals within a multi-signal stage diverge significantly (one elevated, another depressed), a purple ↕ indicator appears next to the stage status, prompting you to expand the stage and examine the individual components.</p>
+<p style="color:#eee;font-weight:700;font-size:1.1em;margin-bottom:8px;letter-spacing:1px">🔗 THE INFORMATION FLOW CHAIN</p>
+<p style="margin-bottom:8px">The dashboard is organised around how geopolitical information typically propagates through different systems. During a developing crisis, signals tend to activate in a predictable sequence:</p>
+<p style="margin-bottom:4px"><strong style="color:#eee">Stage 1 — Physical Observable:</strong> Infrastructure disruptions detectable before anyone reports them. Internet connectivity drops, flight corridors empty, power grids go dark. These are the earliest possible signals — they happen in the physical world before human reporting catches up.</p>
+<p style="margin-bottom:4px"><strong style="color:#eee">Stage 2 — Ground Signal:</strong> Local populations and early observers react. People in affected countries search for "bomb shelter," "evacuation," and "VPN." OSINT accounts begin posting. This is the first human-generated signal layer.</p>
+<p style="margin-bottom:4px"><strong style="color:#eee">Stage 3 — Market Positioning:</strong> Informed money moves. Prediction market contracts shift as traders with information or analytical edge reposition. Defence stocks rise, regional currencies weaken, commodity prices adjust.</p>
+<p style="margin-bottom:8px"><strong style="color:#eee">Stage 4 — Narrative Formation:</strong> Media and the global public catch up. News tone shifts across thousands of articles. Worldwide search interest spikes as the broader public seeks information about the crisis.</p>
+<p style="margin-bottom:16px">The composite score is derived from <strong style="color:#eee">Stage 2 and Stage 3 signals only</strong> — these are the signals most likely to move early and most directly connected to geopolitical events. Stage 1 (Cloudflare internet connectivity) is shown as a separate early warning indicator because internet traffic patterns are influenced by non-geopolitical factors (religious observances, weekends, seasonal patterns) that inject noise into baseline scoring. Stage 4 (GDELT news tone, global search trends) is shown as context because these signals lag during early escalation — during a rapidly developing crisis, waiting for media narrative to shift actively suppresses the composite when earlier stages have already detected genuine signals. When signals within a multi-signal stage diverge significantly (one elevated, another depressed), a purple ↕ indicator appears next to the stage status, prompting you to expand the stage and examine the individual components.</p>
 
-        <p style="color:#eee;font-weight:700;font-size:1.1em;margin-bottom:8px;letter-spacing:1px">📊 HOW THE SCORE WORKS</p>
-        <p style="margin-bottom:16px">Every signal is measured as a z-score — a statistical measure of how far something has moved from its recent average, expressed in standard deviations. A z-score of 0 means "exactly average." A z-score of +2 means "unusually high — this level occurs less than 5% of the time." Z-scores are converted to the 0–100 scale where 50 = normal, 65 ≈ 1 standard deviation above normal, 80 ≈ 2 standard deviations. The same logic applies in reverse: 35 ≈ 1 standard deviation below normal (calmer than usual).</p>
+<p style="color:#eee;font-weight:700;font-size:1.1em;margin-bottom:8px;letter-spacing:1px">📊 HOW THE SCORE WORKS</p>
+<p style="margin-bottom:16px">Every signal is measured as a z-score — a statistical measure of how far something has moved from its recent average, expressed in standard deviations. A z-score of 0 means "exactly average." A z-score of +2 means "unusually high — this level occurs less than 5% of the time." Z-scores are converted to the 0–100 scale where 50 = normal, 65 ≈ 1 standard deviation above normal, 80 ≈ 2 standard deviations. The same logic applies in reverse: 35 ≈ 1 standard deviation below normal (calmer than usual).</p>
 
-        <p style="color:#eee;font-weight:700;font-size:1.1em;margin-bottom:8px;letter-spacing:1px">⚡ STAGE 1 — INTERNET CONNECTIVITY (Early Warning)</p>
-        <p style="margin-bottom:8px">Cloudflare Radar monitors internet traffic volumes across countries worldwide. During geopolitical crises, internet connectivity often drops — governments impose shutdowns, infrastructure is damaged by military action, or populations lose power. The dashboard tracks hourly traffic for 27 countries across the three regions, comparing the current hour's traffic to the same hour on each of the prior 29 days. This hour-matching accounts for normal daily usage patterns, and the 30-day baseline ensures robust standard deviations.</p>
-        <p style="margin-bottom:16px">Country scores are aggregated using dynamic weighting rather than a simple average — a single country losing internet entirely receives amplified weight so it is not drowned out by neighbouring countries with normal connectivity. The amplification follows a quadratic curve: small deviations barely trigger, but severe drops escalate rapidly. Internet connectivity is shown as a separate early warning indicator rather than scored because traffic patterns are influenced by non-geopolitical factors (religious observances like Ramadan, weekends, seasonal patterns) that inject noise into baseline scoring.</p>
+<p style="color:#eee;font-weight:700;font-size:1.1em;margin-bottom:8px;letter-spacing:1px">⚡ STAGE 1 — INTERNET CONNECTIVITY (Early Warning)</p>
+<p style="margin-bottom:8px">Cloudflare Radar monitors internet traffic volumes across countries worldwide. During geopolitical crises, internet connectivity often drops — governments impose shutdowns, infrastructure is damaged by military action, or populations lose power. The dashboard tracks hourly traffic for 27 countries across the three regions, comparing the current hour's traffic to the same hour on each of the prior 29 days. This hour-matching accounts for normal daily usage patterns, and the 30-day baseline ensures robust standard deviations.</p>
+<p style="margin-bottom:16px">Country scores are aggregated using dynamic weighting rather than a simple average — a single country losing internet entirely receives amplified weight so it is not drowned out by neighbouring countries with normal connectivity. The amplification follows a quadratic curve: small deviations barely trigger, but severe drops escalate rapidly. Internet connectivity is shown as a separate early warning indicator rather than scored because traffic patterns are influenced by non-geopolitical factors (religious observances like Ramadan, weekends, seasonal patterns) that inject noise into baseline scoring.</p>
 
-        <p style="color:#eee;font-weight:700;font-size:1.1em;margin-bottom:8px;letter-spacing:1px">📡 STAGE 2 — PANIC SEARCH TRENDS (Weight: 25%)</p>
-        <p style="margin-bottom:8px">Google Trends measures what people are searching for in real-time. The dashboard tracks country-specific panic terms — searches from within affected countries for terms like "VPN", "bomb shelter", "evacuation", "conscription", and "martial law". These are leading indicators — populations search for these terms when they feel personally threatened, often before international media fully covers a developing situation. A spike in "bomb shelter" searches from Israel, or "VPN" searches from Iran, is a qualitatively different signal from global news interest.</p>
-        <p style="margin-bottom:16px">Panic terms that spike above 1.5 standard deviations are flagged as <span style="color:#f87171">PANIC ALERTS</span> on the dashboard. Terms are measured as the last 7 days vs the prior 30-day baseline, with a minimum of 2 successful terms required before the signal contributes to scoring.</p>
+<p style="color:#eee;font-weight:700;font-size:1.1em;margin-bottom:8px;letter-spacing:1px">📡 STAGE 2 — PANIC SEARCH TRENDS (Weight: 25%)</p>
+<p style="margin-bottom:8px">Google Trends measures what people are searching for in real-time. The dashboard tracks country-specific panic terms — searches from within affected countries for terms like "VPN", "bomb shelter", "evacuation", "conscription", and "martial law". These are leading indicators — populations search for these terms when they feel personally threatened, often before international media fully covers a developing situation. A spike in "bomb shelter" searches from Israel, or "VPN" searches from Iran, is a qualitatively different signal from global news interest.</p>
+<p style="margin-bottom:16px">Panic terms that spike above 1.5 standard deviations are flagged as <span style="color:#f87171">PANIC ALERTS</span> on the dashboard. Terms are measured as the last 7 days vs the prior 30-day baseline, with a minimum of 2 successful terms required before the signal contributes to scoring.</p>
 
-        <p style="color:#eee;font-weight:700;font-size:1.1em;margin-bottom:8px;letter-spacing:1px">📈 STAGE 3 — POLYMARKET (Weight: 37.5%)</p>
-        <p style="margin-bottom:8px">Polymarket is a prediction market where people bet real money on whether events will happen. When a contract shows "39% chance of Iran ceasefire breaking by March," that number represents the aggregate belief of thousands of traders putting money behind their predictions. Because real money is at stake, prediction markets tend to be more accurate than polls or pundit opinions.</p>
-        <p style="margin-bottom:8px">The dashboard tracks dozens of geopolitical contracts across three regions. Each contract is classified as either a <strong style="color:#ef4444">THREAT</strong> (war, strikes, invasions — higher probability = more risk) or <strong style="color:#22c55e">DE-ESCALATION</strong> (ceasefires, peace deals, disarmament — higher probability = less risk). De-escalation contracts have their probabilities inverted so that all contracts are expressed on a common "risk" scale.</p>
-        <p style="margin-bottom:8px">Each contract is scored against its own 7-day rolling baseline using z-scores. This means the dashboard doesn't react to the absolute level of a contract (a 10% invasion probability isn't inherently alarming) but rather to how much it has changed relative to its own recent history. A contract jumping from 3% to 8% produces a much stronger signal than one sitting steady at 40%.</p>
-        <p style="margin-bottom:16px">Contracts require a minimum of 50 historical data points before being included in scoring. New contracts appear as <span style="color:#555">IMMATURE</span> on the dashboard and begin contributing to the score after approximately 8 hours of data collection. This prevents a brand-new contract from immediately skewing the regional score before a reliable baseline exists. A minimum volatility threshold of 1 percentage point is also applied — contracts that have barely moved don't generate disproportionate z-scores from statistical noise.</p>
+<p style="color:#eee;font-weight:700;font-size:1.1em;margin-bottom:8px;letter-spacing:1px">📈 STAGE 3 — POLYMARKET (Weight: 37.5%)</p>
+<p style="margin-bottom:8px">Polymarket is a prediction market where people bet real money on whether events will happen. When a contract shows "39% chance of Iran ceasefire breaking by March," that number represents the aggregate belief of thousands of traders putting money behind their predictions. Because real money is at stake, prediction markets tend to be more accurate than polls or pundit opinions.</p>
+<p style="margin-bottom:8px">The dashboard tracks dozens of geopolitical contracts across three regions. Each contract is classified as either a <strong style="color:#ef4444">THREAT</strong> (war, strikes, invasions — higher probability = more risk) or <strong style="color:#22c55e">DE-ESCALATION</strong> (ceasefires, peace deals, disarmament — higher probability = less risk). De-escalation contracts have their probabilities inverted so that all contracts are expressed on a common "risk" scale.</p>
+<p style="margin-bottom:16px">Each contract is scored against its own 7-day rolling baseline using z-scores, calculated from hourly price history provided directly by Polymarket's CLOB API. This means the dashboard doesn't react to the absolute level of a contract (a 10% invasion probability isn't inherently alarming) but rather to how much it has changed relative to its own recent history. A contract jumping from 3% to 8% produces a much stronger signal than one sitting steady at 40%. Contracts created within the last 12 hours may have insufficient price history and are marked as NEW — they begin contributing to the score once enough trading data accumulates. A minimum volatility threshold of 1 percentage point is applied — contracts that have barely moved don't generate disproportionate z-scores from statistical noise.</p>
+<p style="margin-bottom:16px">The regional Polymarket score is a weighted average of individual contract z-scores, where each contract's weight is the square root of its trading volume. This prevents high-volume structural contracts (e.g. "Will the Iranian regime fall?" at $12M volume) from drowning out smaller but acutely significant contracts (e.g. "France/UK/Germany strike Iran" at $69k volume). With linear volume weighting, the $12M contract would outweigh the $69k contract by 174x — meaning even an extreme z-score of +4.5 on the smaller contract would barely register. Square root weighting compresses this ratio to approximately 13x, ensuring that volume still matters (high-volume contracts carry more weight as they represent broader market consensus) while allowing sharp moves on smaller contracts to meaningfully impact the score. The "Weight" column in the contract list shows each contract's percentage contribution to the regional score, calculated from its z-score multiplied by its square root volume weight.</p>
+<p style="margin-bottom:16px">Prediction markets may occasionally function as a leading indicator ahead of all other signal stages. Because Polymarket allows anonymous, real-money betting, actors with advance knowledge of military operations can position ahead of events — producing unusual price movements before physical infrastructure disruptions, panic searches, or media coverage. An <a href="https://www.ft.com/content/2883d3d4-aea2-4984-b994-4640593eed55" style="color:#818cf8" target="_blank">FT investigation</a> identified 12 suspicious accounts that placed large, well-timed wagers on the US attack on Iran on February 28, 2026, with roughly half of the bets arriving in the six hours before the strikes began. The implied probability of the Feb 28 deadline contract diverged sharply from the pattern of previous deadline contracts — a deviation the dashboard's z-score methodology is designed to detect. This informed positioning means Polymarket can, in specific circumstances, act as a Stage 0 signal — detecting insider knowledge before any physical or public observable.</p>
 
-        <p style="color:#eee;font-weight:700;font-size:1.1em;margin-bottom:8px;letter-spacing:1px">📈 STAGE 3 — FINANCIAL MARKETS (Weight: 37.5%)</p>
-        <p style="margin-bottom:8px">Geopolitical tension leaves fingerprints in financial markets. When conflict risk rises, certain assets tend to move in predictable ways: defence stocks rise (Rheinmetall, BAE Systems, Elbit Systems) as investors anticipate increased military spending. Commodities spike (oil, gold, natural gas) as supply disruption fears grow and investors seek safe havens. Regional equity indices fall (Germany, Israel, Taiwan) as local economic risk increases.</p>
-        <p style="margin-bottom:16px">The dashboard tracks 21 tickers across the three regions plus 2 global tickers (Gold and US Defence ETF) that feed into every region. Each ticker's daily percentage move is compared to its own 90-day rolling average using z-scores — the same "how unusual is today compared to recent history" approach. Regional index ETFs have their z-scores <span style="color:#f97316">▼ INVERTED</span> so that a falling market registers as elevated risk. Tickers marked <span style="color:#666">⊕ GLOBAL</span> contribute to all three regional scores equally.</p>
+<p style="color:#eee;font-weight:700;font-size:1.1em;margin-bottom:8px;letter-spacing:1px">📈 STAGE 3 — FINANCIAL MARKETS (Weight: 37.5%)</p>
+<p style="margin-bottom:8px">Geopolitical tension leaves fingerprints in financial markets. When conflict risk rises, certain assets tend to move in predictable ways: defence stocks rise (Rheinmetall, BAE Systems, Elbit Systems) as investors anticipate increased military spending. Commodities spike (oil, gold, natural gas) as supply disruption fears grow and investors seek safe havens. Regional equity indices fall (Germany, Israel, Taiwan) as local economic risk increases.</p>
+<p style="margin-bottom:16px">The dashboard tracks 21 tickers across the three regions plus 2 global tickers (Gold and US Defence ETF) that feed into every region. Each ticker's daily percentage move is compared to its own 90-day rolling average using z-scores — the same "how unusual is today compared to recent history" approach. Regional index ETFs have their z-scores <span style="color:#f97316">▼ INVERTED</span> so that a falling market registers as elevated risk. Tickers marked <span style="color:#666">⊕ GLOBAL</span> contribute to all three regional scores equally.</p>
 
-        <p style="color:#eee;font-weight:700;font-size:1.1em;margin-bottom:8px;letter-spacing:1px">📰 STAGE 4 — GDELT NEWS TONE (Context Only)</p>
-        <p style="margin-bottom:8px">The GDELT Project monitors news media worldwide and measures the average "tone" of articles. The dashboard queries GDELT's full event database via Google BigQuery, filtering to conflict-related events only (verbal conflict such as threats and demands, and material conflict such as military action and armed clashes) geolocated to countries in each region. This captures thousands of conflict-specific articles per day across dozens of countries.</p>
-        <p style="margin-bottom:16px">The dashboard compares the last 72 hours of conflict news tone against the 30-day baseline. It also tracks article volume — a sudden spike in the number of conflict articles about a region, even without a tone change, indicates increased attention. GDELT is shown as context rather than scored because it reflects the media cycle rather than real-time positioning — it confirms what faster signals have already detected but lags during early escalation.</p>
+<p style="color:#eee;font-weight:700;font-size:1.1em;margin-bottom:8px;letter-spacing:1px">📰 STAGE 4 — GDELT NEWS TONE (Context Only)</p>
+<p style="margin-bottom:8px">The GDELT Project monitors news media worldwide and measures the average "tone" of articles. The dashboard queries GDELT's full event database via Google BigQuery, filtering to conflict-related events only (verbal conflict such as threats and demands, and material conflict such as military action and armed clashes) geolocated to countries in each region. This captures thousands of conflict-specific articles per day across dozens of countries.</p>
+<p style="margin-bottom:16px">The dashboard compares the last 72 hours of conflict news tone against the 30-day baseline. It also tracks article volume — a sudden spike in the number of conflict articles about a region, even without a tone change, indicates increased attention. GDELT is shown as context rather than scored because it reflects the media cycle rather than real-time positioning — it confirms what faster signals have already detected but lags during early escalation.</p>
 
-        <p style="color:#eee;font-weight:700;font-size:1.1em;margin-bottom:8px;letter-spacing:1px">🔍 STAGE 4 — GLOBAL SEARCH TRENDS (Context Only)</p>
-        <p style="margin-bottom:16px">Worldwide search interest for region-specific conflict keywords (e.g. "Iran strike", "Russia Ukraine war", "China Taiwan"). When a crisis develops, search volume for these terms spikes as the global public seeks information. Measured as the last 7 days vs the 30-day baseline. Shown as context rather than scored because global search interest lags behind ground-level panic indicators and market positioning.</p>
+<p style="color:#eee;font-weight:700;font-size:1.1em;margin-bottom:8px;letter-spacing:1px">🔍 STAGE 4 — GLOBAL SEARCH TRENDS (Context Only)</p>
+<p style="margin-bottom:16px">Worldwide search interest for region-specific conflict keywords (e.g. "Iran strike", "Russia Ukraine war", "China Taiwan"). When a crisis develops, search volume for these terms spikes as the global public seeks information. Measured as the last 7 days vs the 30-day baseline. Shown as context rather than scored because global search interest lags behind ground-level panic indicators and market positioning.</p>
 
-        <p style="color:#eee;font-weight:700;font-size:1.1em;margin-bottom:8px;letter-spacing:1px">📋 SUPPLEMENTAL — ACLED CONFLICT FORECASTS</p>
-        <p style="margin-bottom:16px">ACLED's CAST system provides monthly conflict event forecasts for countries worldwide. Because these forecasts only update monthly, they are shown as supplemental context — they do not affect the score.</p>
+<p style="color:#eee;font-weight:700;font-size:1.1em;margin-bottom:8px;letter-spacing:1px">📋 SUPPLEMENTAL — ACLED CONFLICT FORECASTS</p>
+<p style="margin-bottom:16px">ACLED's CAST system provides monthly conflict event forecasts for countries worldwide. Because these forecasts only update monthly, they are shown as supplemental context — they do not affect the score.</p>
 
-        <p style="color:#eee;font-weight:700;font-size:1.1em;margin-bottom:8px;letter-spacing:1px">🗺️ REGIONAL & GLOBAL SCORING</p>
-        <p style="margin-bottom:8px">Each region (Europe, Middle East, Asia-Pacific) scores three signals — Polymarket (37.5%), Financial Markets (37.5%), and Panic Search Trends (25%). The global score is 85% weighted regional aggregate plus 15% global-only Polymarket contracts (nuclear detonation, world war, and other contracts that don't belong to a single region). Regions with elevated scores receive amplified weighting in the global aggregate — a regional crisis pulls the global score up more than proportionally.</p>
-        <p style="margin-bottom:16px">The convergence indicator shows whether the scored signals agree. A single elevated signal could be noise — but when Polymarket, financial markets, and panic searches all move in the same direction simultaneously, that's a much stronger signal. The indicator labels range from Quiet (all normal) through Early Signal (one signal elevated) to Broad Escalation (all signals elevated).</p>
+<p style="color:#eee;font-weight:700;font-size:1.1em;margin-bottom:8px;letter-spacing:1px">🗺️ REGIONAL & GLOBAL SCORING</p>
+<p style="margin-bottom:8px">Each region (Europe, Middle East, Asia-Pacific) scores three signals — Polymarket (37.5%), Financial Markets (37.5%), and Panic Search Trends (25%). The global score is 85% weighted regional aggregate plus 15% global-only Polymarket contracts (nuclear detonation, world war, and other contracts that don't belong to a single region). Regions with elevated scores receive amplified weighting in the global aggregate — a regional crisis pulls the global score up more than proportionally.</p>
+<p style="margin-bottom:16px">The convergence indicator shows whether the scored signals agree. A single elevated signal could be noise — but when Polymarket, financial markets, and panic searches all move in the same direction simultaneously, that's a much stronger signal. The indicator labels range from Quiet (all normal) through Early Signal (one signal elevated) to Broad Escalation (all signals elevated).</p>
 
-        <p style="color:#eee;font-weight:700;font-size:1.1em;margin-bottom:8px;letter-spacing:1px">📋 READING THE CONTRACT LIST</p>
-        <p style="margin-bottom:16px">Each Polymarket contract row shows: the contract question, its classification (<span style="color:#ef4444">THREAT</span> or <span style="color:#22c55e">DE-ESC</span>), maturity status with data point count (<span style="color:#818cf8">MATURE</span> or <span style="color:#555">IMMATURE</span>), a 48-hour sparkline showing recent price movement, the current probability, 24-hour change in percentage points (green = risk decreasing, red = risk increasing — contextual to whether the contract is a threat or de-escalation), the contract's z-score against its own 7-day baseline, and its weight contribution to the regional Polymarket score.</p>
+<p style="color:#eee;font-weight:700;font-size:1.1em;margin-bottom:8px;letter-spacing:1px">📋 READING THE CONTRACT LIST</p>
+<p style="margin-bottom:16px">Each Polymarket contract row shows: the contract question, its classification (<span style="color:#ef4444">THREAT</span> or <span style="color:#22c55e">DE-ESC</span>), maturity status with data point count (<span style="color:#818cf8">MATURE</span> or <span style="color:#555">IMMATURE</span>), a 48-hour sparkline showing recent price movement, the current probability, 24-hour change in percentage points (green = risk decreasing, red = risk increasing — contextual to whether the contract is a threat or de-escalation), the contract's z-score against its own 7-day baseline, and its weight contribution to the regional Polymarket score.</p>
 
-        <p style="color:#eee;font-weight:700;font-size:1.1em;margin-bottom:8px;letter-spacing:1px">⚠️ LIMITATIONS</p>
-        <p>This dashboard detects deviation from recent baseline, not absolute danger. A score of 70 during a period that has been generally calm means something different than 70 during an ongoing crisis — in the latter case, "normal" is already elevated, so 70 means conditions are unusual even by crisis standards. Polymarket contracts on geopolitical events tend to be thinly traded compared to financial markets, so individual contract moves can be noisy. The 7-day baseline and 24-hour change can tell different stories — a contract might show a positive 24h change but a negative z-score if the recent move is a partial recovery from a larger weekly decline. GDELT measures media narrative, not ground truth — media amplification cycles can produce false signals. Financial markets move for many non-geopolitical reasons (earnings, monetary policy, macro data), so an elevated Financial Markets signal in isolation is weaker evidence of geopolitical risk than an elevated Polymarket signal.</p>
-    </div>
+<p style="color:#eee;font-weight:700;font-size:1.1em;margin-bottom:8px;letter-spacing:1px">⚠️ LIMITATIONS</p>
+<p>This dashboard detects deviation from recent baseline, not absolute danger. A score of 70 during a period that has been generally calm means something different than 70 during an ongoing crisis — in the latter case, "normal" is already elevated, so 70 means conditions are unusual even by crisis standards. Polymarket contracts on geopolitical events tend to be thinly traded compared to financial markets, so individual contract moves can be noisy. The 7-day baseline and 24-hour change can tell different stories — a contract might show a positive 24h change but a negative z-score if the recent move is a partial recovery from a larger weekly decline. GDELT measures media narrative, not ground truth — media amplification cycles can produce false signals. Financial markets move for many non-geopolitical reasons (earnings, monetary policy, macro data), so an elevated Financial Markets signal in isolation is weaker evidence of geopolitical risk than an elevated Polymarket signal.</p>
+</div>
 
-    <footer>Geopolitical Risk Dashboard v1.0 • Stage-Based Monitoring • Data: Polymarket + yfinance + GDELT BigQuery + Google Trends + Cloudflare Radar + ACLED CAST</footer>
+<footer>Geopolitical Risk Dashboard v1.0 • Stage-Based Monitoring • Data: Polymarket + yfinance + GDELT BigQuery + Google Trends + Cloudflare Radar + ACLED CAST</footer>
 </div>
 {% endif %}
 
 <script>
-const _cd={{ score_history|tojson }};
-const _rh={{ regional_history|tojson }};
-const _rc={'europe':'#818cf8','middle_east':'#fbbf24','asia_pacific':'#34d399'};
+const _cd={{ score_history|tojson }};const _rh={{ regional_history|tojson }};const _rc={'europe':'#818cf8','middle_east':'#fbbf24','asia_pacific':'#34d399'};
 Chart.defaults.color='#888';Chart.defaults.font.family="-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif";Chart.defaults.font.size=11;
-let _gc=null,_gtf='48h',_rcs={},_rtfs={};
-
+let _gc=null,_gtf='48h',_rtfs={};
 function toggleDD(id){const el=document.getElementById(id);if(el)el.classList.toggle('open');}
-function toggleStage(id){const el=document.getElementById(id);if(el)el.classList.toggle('open');}
-
-function filterTF(data,tf,dk){
-    if(tf==='all')return data;const now=new Date();let co;
-    if(tf==='48h')co=new Date(now-48*3600000);else if(tf==='1w')co=new Date(now-7*86400000);else if(tf==='1m')co=new Date(now-30*86400000);else return data;
-    return data.filter(d=>new Date(d[dk])>=co);
-}
+function toggleStage(id){const el=document.getElementById(id);if(el){el.classList.toggle('open');if(el.classList.contains('open')){const m=id.match(/stage-(\w+)-(\d)/);if(m)setTimeout(()=>drawStageChart(m[1],'s'+m[2]),50);}}}
+function filterTF(data,tf,dk){if(tf==='all')return data;const now=new Date();let co;if(tf==='48h')co=new Date(now-48*3600000);else if(tf==='1w')co=new Date(now-7*86400000);else if(tf==='1m')co=new Date(now-30*86400000);else return data;return data.filter(d=>new Date(d[dk])>=co);}
 function fmtL(ds){const d=new Date(ds);return d.toLocaleDateString('en-GB',{day:'numeric',month:'short'})+' '+d.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'});}
 function fmtS(ds){return new Date(ds).toLocaleDateString('en-GB',{day:'numeric',month:'short'});}
-
 function setGlobalTF(tf){_gtf=tf;document.querySelectorAll('#dd-global-history .tf-btn').forEach(b=>b.classList.remove('active'));event.target.classList.add('active');redrawGlobalChart();}
 function setRTF(rk,tf){_rtfs[rk]=tf;const v=document.getElementById('dd-'+rk+'-history');if(v)v.querySelectorAll('.tf-btn').forEach(b=>b.classList.remove('active'));event.target.classList.add('active');drawRC(rk);}
+function redrawGlobalChart(){const cv=document.getElementById('globalChart');if(!cv)return;if(_gc){_gc.destroy();_gc=null;}const fd=filterTF(_cd,_gtf,'recorded_at');if(!fd.length)return;const labels=fd.map(d=>fmtS(d.recorded_at)),ds=[];if(document.getElementById('tgl-composite')&&document.getElementById('tgl-composite').checked)ds.push({label:'Global',data:fd.map(d=>d.composite_score),borderColor:'#eab308',borderWidth:2.5,pointRadius:0,pointHitRadius:8,tension:.3,fill:false});['europe','middle_east','asia_pacific'].forEach(rk=>{const tg=document.getElementById('tgl-'+rk);if(!tg||!tg.checked)return;const rd=filterTF(_rh[rk]||[],_gtf,'recorded_at');if(!rd.length)return;const gt=fd.map(d=>new Date(d.recorded_at).getTime());const al=gt.map(g=>{let cl=null,md=Infinity;for(const r of rd){const df=Math.abs(new Date(r.recorded_at).getTime()-g);if(df<md){md=df;cl=r;}}return cl&&md<7200000?cl.score:null;});ds.push({label:rk.replace('_',' '),data:al,borderColor:_rc[rk],borderWidth:1.5,pointRadius:0,pointHitRadius:8,tension:.3,spanGaps:true,fill:false});});_gc=new Chart(cv,{type:'line',data:{labels,datasets:ds},options:{responsive:true,maintainAspectRatio:false,animation:{duration:300},interaction:{mode:'index',intersect:false},plugins:{legend:{display:false},tooltip:{backgroundColor:'#1a1a2e',borderColor:'#333',borderWidth:1,titleColor:'#eee',bodyColor:'#ccc',callbacks:{title:i=>i[0]?fmtL(fd[i[0].dataIndex].recorded_at):'',label:i=>' '+i.dataset.label+': '+(i.parsed.y!==null?i.parsed.y.toFixed(1):'—')}}},scales:{x:{grid:{color:'#1a1a2e'},ticks:{maxTicksLimit:6,color:'#555',font:{size:9}}},y:{min:0,max:100,grid:{color:ctx=>ctx.tick.value===50?'#333':'#111118'},ticks:{stepSize:25,color:'#555',callback:v=>v===50?'50':v}}}}});}
+function drawRC(rk){/* legacy — replaced by stage charts */}
+// Stage chart config: which data keys and colours per stage
+const _stageCfg={
+    s1:[{key:'score',colour:'#eab308',w:2.5,l:'Composite'},{key:'cloudflare',colour:'#06b6d4',w:1.5,l:'Internet Traffic'}],
+    s2:[{key:'score',colour:'#eab308',w:2.5,l:'Composite'},{key:'gt_panic',colour:'#f97316',w:1.5,l:'Panic'}],
+    s3:[{key:'score',colour:'#eab308',w:2.5,l:'Composite'},{key:'pm',colour:'#3b82f6',w:1.5,l:'Polymarket'},{key:'mkt',colour:'#8b5cf6',w:1.5,l:'Markets'}],
+    s4:[{key:'score',colour:'#eab308',w:2.5,l:'Composite'},{key:'gdelt',colour:'#22c55e',w:1.5,l:'GDELT'},{key:'gt_global',colour:'#ef4444',w:1.5,l:'Global Search'}]
+};
+let _scs={};// stage chart instances keyed by 'rk-s1' etc
 
-function redrawGlobalChart(){
-    const cv=document.getElementById('globalChart');if(!cv)return;if(_gc){_gc.destroy();_gc=null;}
-    const fd=filterTF(_cd,_gtf,'recorded_at');if(!fd.length)return;
-    const labels=fd.map(d=>fmtS(d.recorded_at)),ds=[];
-    if(document.getElementById('tgl-composite')&&document.getElementById('tgl-composite').checked)
-        ds.push({label:'Global',data:fd.map(d=>d.composite_score),borderColor:'#eab308',borderWidth:2.5,pointRadius:0,pointHitRadius:8,tension:0.3,fill:false});
-    ['europe','middle_east','asia_pacific'].forEach(rk=>{
-        const tg=document.getElementById('tgl-'+rk);if(!tg||!tg.checked)return;
-        const rd=filterTF(_rh[rk]||[],_gtf,'recorded_at');if(!rd.length)return;
-        const gt=fd.map(d=>new Date(d.recorded_at).getTime());
-        const al=gt.map(g=>{let cl=null,md=Infinity;for(const r of rd){const df=Math.abs(new Date(r.recorded_at).getTime()-g);if(df<md){md=df;cl=r;}}return cl&&md<7200000?cl.score:null;});
-        ds.push({label:rk.replace('_',' '),data:al,borderColor:_rc[rk],borderWidth:1.5,pointRadius:0,pointHitRadius:8,tension:0.3,spanGaps:true,fill:false});
-    });
-    _gc=new Chart(cv,{type:'line',data:{labels,datasets:ds},options:{responsive:true,maintainAspectRatio:false,animation:{duration:300},interaction:{mode:'index',intersect:false},plugins:{legend:{display:false},tooltip:{backgroundColor:'#1a1a2e',borderColor:'#333',borderWidth:1,titleColor:'#eee',bodyColor:'#ccc',callbacks:{title:i=>i[0]?fmtL(fd[i[0].dataIndex].recorded_at):'',label:i=>' '+i.dataset.label+': '+(i.parsed.y!==null?i.parsed.y.toFixed(1):'—')}}},scales:{x:{grid:{color:'#1a1a2e'},ticks:{maxTicksLimit:6,color:'#555',font:{size:9}}},y:{min:0,max:100,grid:{color:ctx=>ctx.tick.value===50?'#333':'#111118'},ticks:{stepSize:25,color:'#555',callback:v=>v===50?'50':v}}}}});
-}
-
-function drawRC(rk){
-    const cv=document.getElementById('chart-'+rk);if(!cv)return;if(_rcs[rk]){_rcs[rk].destroy();_rcs[rk]=null;}
-    const tf=_rtfs[rk]||'48h',rd=filterTF(_rh[rk]||[],tf,'recorded_at');if(!rd.length)return;
-    const labels=rd.map(d=>fmtS(d.recorded_at)),ds=[],rc=_rc[rk]||'#eab308';
-    [{id:'comp',key:'score',colour:rc,w:2.5,l:'Composite'},{id:'pm',key:'pm',colour:'#3b82f6',w:1.5,l:'PM'},{id:'mkt',key:'mkt',colour:'#8b5cf6',w:1.5,l:'Mkt'},{id:'gdelt',key:'gdelt',colour:'#22c55e',w:1.5,l:'GDELT'},{id:'panic',key:'gt_panic',colour:'#f97316',w:1.5,l:'Panic'},{id:'cf',key:'cloudflare',colour:'#06b6d4',w:1.5,l:'Internet'}].forEach(t=>{
-        const el=document.getElementById('tgl-'+rk+'-'+t.id);if(!el||!el.checked)return;
+function drawStageChart(rk,stage){
+    const id='chart-'+rk+'-'+stage;const cv=document.getElementById(id);if(!cv)return;
+    // Skip if canvas is hidden (parent stage collapsed)
+    if(cv.offsetParent===null)return;
+    const k=rk+'-'+stage;if(_scs[k]){_scs[k].destroy();_scs[k]=null;}
+    const tf=_stfs[rk+'-'+stage]||_rtfs[rk]||'48h';const rd=filterTF(_rh[rk]||[],tf,'recorded_at');if(!rd.length)return;
+    const labels=rd.map(d=>fmtS(d.recorded_at)),ds=[];
+    const cfg=_stageCfg[stage]||[];
+    cfg.forEach(t=>{
+        const tgl=document.getElementById('tgl-'+rk+'-'+stage+'-'+t.key);
+        if(tgl&&!tgl.checked)return;
         const vals=rd.map(d=>d[t.key]);if(vals.every(v=>v===null||v===undefined))return;
-        ds.push({label:t.l,data:vals,borderColor:t.colour,borderWidth:t.w,pointRadius:0,pointHitRadius:8,tension:0.3,spanGaps:true,fill:false});
+        ds.push({label:t.l,data:vals,borderColor:t.colour,borderWidth:t.w,pointRadius:0,pointHitRadius:8,tension:.3,spanGaps:true,fill:false});
     });
-    _rcs[rk]=new Chart(cv,{type:'line',data:{labels,datasets:ds},options:{responsive:true,maintainAspectRatio:false,animation:{duration:300},interaction:{mode:'index',intersect:false},plugins:{legend:{display:false},tooltip:{backgroundColor:'#1a1a2e',borderColor:'#333',borderWidth:1,titleColor:'#eee',bodyColor:'#ccc',callbacks:{title:i=>i[0]?fmtL(rd[i[0].dataIndex].recorded_at):'',label:i=>' '+i.dataset.label+': '+(i.parsed.y!==null?i.parsed.y.toFixed(1):'—')}}},scales:{x:{grid:{color:'#1a1a2e'},ticks:{maxTicksLimit:6,color:'#555',font:{size:9}}},y:{min:0,max:100,grid:{color:ctx=>ctx.tick.value===50?'#333':'#111118'},ticks:{stepSize:25,color:'#555',callback:v=>v===50?'50':v}}}}});
+    if(!ds.length)return;
+    _scs[k]=new Chart(cv,{type:'line',data:{labels,datasets:ds},options:{responsive:true,maintainAspectRatio:false,animation:{duration:300},interaction:{mode:'index',intersect:false},plugins:{legend:{display:false},tooltip:{backgroundColor:'#1a1a2e',borderColor:'#333',borderWidth:1,titleColor:'#eee',bodyColor:'#ccc',callbacks:{title:i=>i[0]?fmtL(rd[i[0].dataIndex].recorded_at):'',label:i=>' '+i.dataset.label+': '+(i.parsed.y!==null?i.parsed.y.toFixed(1):'—')}}},scales:{x:{grid:{color:'#1a1a2e'},ticks:{maxTicksLimit:6,color:'#555',font:{size:9}}},y:{min:0,max:100,grid:{color:ctx=>ctx.tick.value===50?'#333':'#0a0a12'},ticks:{stepSize:25,color:'#555',font:{size:9},callback:v=>v===50?'50':v}}}}});
 }
 
-function switchView(vi){
-    document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
-    document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
-    document.getElementById('view-'+vi).classList.add('active');
-    const tabs=document.querySelectorAll('.tab'),keys=['global',{% for rk in regional_composites %}'{{rk}}',{% endfor %}];
-    const idx=keys.indexOf(vi);if(idx>=0&&tabs[idx])tabs[idx].classList.add('active');
-    setTimeout(()=>{if(vi==='global')redrawGlobalChart();else drawRC(vi);},100);
+function drawAllStageCharts(rk){['s1','s2','s3','s4'].forEach(s=>{
+    const stageEl=document.getElementById('stage-'+rk+'-'+s.charAt(1));
+    if(stageEl&&stageEl.classList.contains('open'))drawStageChart(rk,s);
+});}
+
+let _stfs={};// per-stage timeframes keyed by 'rk-s1' etc
+
+function setRTFStage(rk,stage,tf,btn){
+    _stfs[rk+'-'+stage]=tf;
+    btn.parentElement.querySelectorAll('.tf-btn').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    drawStageChart(rk,stage);
 }
 
-// ==================== LIVE UPDATES ====================
+function setRTFSync(rk,tf,btn){
+    _rtfs[rk]=tf;['s1','s2','s3','s4'].forEach(s=>{_stfs[rk+'-'+s]=tf;});
+    btn.parentElement.querySelectorAll('.tf-btn').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    drawAllStageCharts(rk);
+}
+
+function setRTF(rk,tf){_rtfs[rk]=tf;drawAllStageCharts(rk);}
+function switchView(vi){document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));document.getElementById('view-'+vi).classList.add('active');const tabs=document.querySelectorAll('.tab'),keys=['global',{% for rk in regional_composites %}'{{rk}}',{% endfor %}];const idx=keys.indexOf(vi);if(idx>=0&&tabs[idx])tabs[idx].classList.add('active');setTimeout(()=>{if(vi==='global')redrawGlobalChart();else drawAllStageCharts(vi);},200);}
 let _lastUp=Date.now();
-function animateScore(el,nv){
-    if(!el)return;const cur=parseFloat(el.textContent)||0,tgt=parseFloat(nv)||0,diff=tgt-cur;
-    if(Math.abs(diff)<0.05){el.textContent=tgt.toFixed(1);return;}
-    let step=0;const steps=20,timer=setInterval(()=>{step++;const p=step/steps,e=p<0.5?2*p*p:(1-Math.pow(-2*p+2,2)/2);
-    el.textContent=(cur+diff*e).toFixed(1);if(step>=steps){el.textContent=tgt.toFixed(1);clearInterval(timer);}},40);
-}
-function applyLive(d){
-    if(!d||d.error)return;
-    const gse=document.querySelector('#view-global .sc-num');if(gse)animateScore(gse,d.composite);
-    const gle=document.querySelector('#view-global .sc-label');if(gle){gle.textContent=d.risk_level;gle.style.color=d.risk_colour;}
-    const gde=document.querySelector('#view-global .bar-dot');if(gde){gde.style.left=d.composite+'%';gde.style.background=d.risk_colour;}
-    document.body.style.borderTopColor=d.risk_colour;
-    const ts=document.querySelectorAll('.tab-score');if(ts[0]){animateScore(ts[0],d.composite);ts[0].style.color=d.risk_colour;}
-    ['europe','middle_east','asia_pacific'].forEach((rk,ri)=>{
-        const rd=d.regions[rk];if(!rd)return;
-        if(ts[ri+1]){animateScore(ts[ri+1],rd.composite);ts[ri+1].style.color=rd.colour;}
-        const rse=document.querySelector('#view-'+rk+' .sc-num');if(rse){animateScore(rse,rd.composite);rse.style.color=rd.colour;}
-        const rce=document.querySelector('#view-'+rk+' .sc-conv');if(rce){rce.innerHTML=rd.convergence_label+(rd.convergence_detail?' <span>— '+rd.convergence_detail+'</span>':'');rce.style.color=rd.convergence_colour;}
-        const rde=document.querySelector('#view-'+rk+' .bar-dot');if(rde){rde.style.left=rd.composite+'%';rde.style.background=rd.colour;}
-        const rcard=document.getElementById('rcard-'+rk);
-        if(rcard){const rs=rcard.querySelector('.rcard-score');if(rs){animateScore(rs,rd.composite);rs.style.color=rd.colour;}}
-    });
-    _lastUp=Date.now();
-}
+function animateScore(el,nv){if(!el)return;const cur=parseFloat(el.textContent)||0,tgt=parseFloat(nv)||0,diff=tgt-cur;if(Math.abs(diff)<.05){el.textContent=tgt.toFixed(1);return;}let step=0;const steps=20,timer=setInterval(()=>{step++;const p=step/steps,e=p<.5?2*p*p:(1-Math.pow(-2*p+2,2)/2);el.textContent=(cur+diff*e).toFixed(1);if(step>=steps){el.textContent=tgt.toFixed(1);clearInterval(timer);}},40);}
+function applyLive(d){if(!d||d.error)return;const gse=document.querySelector('#view-global .sc-num');if(gse)animateScore(gse,d.composite);const gle=document.querySelector('#view-global .sc-label');if(gle){gle.textContent=d.risk_level;gle.style.color=d.risk_colour;}const gde=document.querySelector('#view-global .bar-dot');if(gde){gde.style.left=d.composite+'%';gde.style.background=d.risk_colour;}document.body.style.borderTopColor=d.risk_colour;const ts=document.querySelectorAll('.tab-score');if(ts[0]){animateScore(ts[0],d.composite);ts[0].style.color=d.risk_colour;}['europe','middle_east','asia_pacific'].forEach((rk,ri)=>{const rd=d.regions[rk];if(!rd)return;if(ts[ri+1]){animateScore(ts[ri+1],rd.composite);ts[ri+1].style.color=rd.colour;}const rse=document.querySelector('#view-'+rk+' .sc-num');if(rse){animateScore(rse,rd.composite);rse.style.color=rd.colour;}const rce=document.querySelector('#view-'+rk+' .sc-conv');if(rce){rce.innerHTML=rd.convergence_label+(rd.convergence_detail?' <span>— '+rd.convergence_detail+'</span>':'');rce.style.color=rd.convergence_colour;}const rde=document.querySelector('#view-'+rk+' .bar-dot');if(rde){rde.style.left=rd.composite+'%';rde.style.background=rd.colour;}const rcard=document.getElementById('rcard-'+rk);if(rcard){const rs=rcard.querySelector('.rcard-score');if(rs){animateScore(rs,rd.composite);rs.style.color=rd.colour;}}});_lastUp=Date.now();}
 function fetchLive(){fetch('/api/scores').then(r=>r.json()).then(d=>applyLive(d)).catch(e=>console.log('Live err:',e));}
 setInterval(fetchLive,60000);
 setInterval(()=>{const c=document.getElementById('live-counter');if(!c)return;const a=Math.round((Date.now()-_lastUp)/1000);c.textContent=a<5?'Live — just updated':a<60?'Live — '+a+'s ago':'Updating — '+Math.round(a/60)+'m ago';c.style.color=a>300?'#f97316':'#555';},1000);
-
 setTimeout(()=>redrawGlobalChart(),200);
 </script>
-</body>
-</html>
+</body></html>
 """
 
-
 # ============================================================
-# >>> PART 3 — Paste directly after Part 2
+# >>> PART 3 — Paste directly after Part 2's closing """
 # ============================================================
 
 
@@ -2137,7 +1790,7 @@ def refresh_dashboard_data():
         # --- Polymarket ---
         events = fetch_polymarket_events()
         geo_markets = filter_geopolitical_markets(events)
-        pm_baselines = fetch_contract_baselines()
+        pm_baselines = fetch_clob_baselines(geo_markets)
         if pm_baselines:
             pm_score, pm_stats = calculate_polymarket_score_normalised(geo_markets, pm_baselines)
         else:
@@ -2166,6 +1819,7 @@ def refresh_dashboard_data():
             r, q = m.get("region", "global"), m.get("question", "")
             bl = pm_baselines.get(q, {})
             is_mature, dp_count = bl.get("mature", False), bl.get("count", 0)
+            is_new = bl.get("is_new", not is_mature and dp_count < 12)
             cz = round((m["risk_price"] - bl["mean"]) / max(bl["std"], PM_STD_FLOOR), 2) if is_mature and bl.get("std", 0) > 0.001 else None
             spark_svg = ""
             sp = bl.get("sparkline", [])
@@ -2187,7 +1841,7 @@ def refresh_dashboard_data():
             if is_mature:
                 cl = _contrib_lookup.get(m["question"][:60])
                 if cl: contrib_pct, contrib_dir = cl["pct"], cl["dir"]
-            entry = {"question": m["question"], "probability_pct": m["probability_pct"], "risk_pct": m.get("risk_pct", m["probability_pct"]), "colour": get_prob_colour(100 - m["probability_pct"]) if m["is_deescalation"] else get_prob_colour(m["probability_pct"]), "is_deescalation": m["is_deescalation"], "is_mature": is_mature, "dp_count": dp_count, "z_score": cz, "change_24h": prob_change_24h, "change_colour": change_colour, "sparkline_svg": spark_svg, "contrib_pct": contrib_pct, "contrib_dir": contrib_dir}
+            entry = {"question": m["question"], "probability_pct": m["probability_pct"], "risk_pct": m.get("risk_pct", m["probability_pct"]), "colour": get_prob_colour(100 - m["probability_pct"]) if m["is_deescalation"] else get_prob_colour(m["probability_pct"]), "is_deescalation": m["is_deescalation"], "is_mature": is_mature, "is_new": is_new, "dp_count": dp_count, "z_score": cz, "change_24h": prob_change_24h, "change_colour": change_colour, "sparkline_svg": spark_svg, "contrib_pct": contrib_pct, "contrib_dir": contrib_dir}
             if r == "global": global_contracts_list.append(entry)
             else: regional_contracts.setdefault(r, []).append(entry)
 
@@ -2225,6 +1879,20 @@ def refresh_dashboard_data():
         # --- Background signals ---
         gdelt_regional = _gdelt_state.get("regional", {})
         gdelt_fetching = _gdelt_state.get("fetching", False)
+        # If GDELT hasn't fetched yet, run it synchronously now
+        if not gdelt_regional and not gdelt_fetching:
+            try:
+                print("GDELT inline: fetching (no background data available)...")
+                t_gdelt = _time.time()
+                raw = fetch_gdelt_regional()
+                if raw:
+                    scored = calculate_gdelt_regional_scores(raw)
+                    _gdelt_state["regional"] = scored
+                    _gdelt_state["last_updated"] = _time.time()
+                    gdelt_regional = scored
+                    print(f"GDELT inline: updated in {_time.time()-t_gdelt:.1f}s")
+            except Exception as e:
+                print(f"GDELT inline error: {e}")
         gtrends_regional = _gtrends_state.get("regional", {})
         gtrends_fetching = _gtrends_state.get("fetching", False)
         cloudflare_regional = _cloudflare_state.get("regional", {})
@@ -2247,7 +1915,7 @@ def refresh_dashboard_data():
         risk_level, risk_colour = get_risk_level(composite_score)
         print(f"Regional: " + ", ".join(f"{r}={d['composite']}" for r, d in regional_composites.items()) + f" | Global PM={global_pm_score} | Final={composite_score}")
 
-        # Cache scores for /api/scores endpoint
+        # Build alerts for ticker strip and /api/scores
         api_alerts = []
         for rk_a, gt_a in gtrends_regional.items():
             for alert in gt_a.get("panic_alerts", []):
@@ -2256,7 +1924,6 @@ def refresh_dashboard_data():
             for c in cf_a.get("country_details", []):
                 if c["z"] < -1.5:
                     api_alerts.append({"type": "cloudflare", "region": rk_a, "text": f"{COUNTRY_CODE_NAMES.get(c['code'], c['code'])} z={c['z']}"})
-        # Top contract movers (24h change > 5pp)
         for m in geo_markets:
             bl = pm_baselines.get(m.get("question", ""), {})
             if bl.get("price_24h_ago") is not None:
@@ -2270,11 +1937,10 @@ def refresh_dashboard_data():
                     dedup = re.sub(r'\s*before\s+\d{4}.*', '', dedup).strip()
                     dedup = re.sub(r'\s*by\s+(end of\s+)?\d{4}.*', '', dedup).strip()
                     dedup = re.sub(r'\s*in\s+\d{4}.*', '', dedup).strip()
-                    # Risk direction: for de-esc contracts, falling probability = rising risk
                     if m["is_deescalation"]:
-                        risk_rising = change < 0  # peace odds dropping = bad
+                        risk_rising = change < 0
                     else:
-                        risk_rising = change > 0  # threat odds rising = bad
+                        risk_rising = change > 0
                     api_alerts.append({"type": "contract", "region": m.get("region", "global"), "text": f"{m['question'][:50]} {'+'if change>0 else ''}{change}pp to {m['probability_pct']}%", "volume": m.get("volume", 0), "dedup_key": dedup, "risk_rising": risk_rising})
         # Deduplicate contract alerts
         seen_keys = {}
@@ -2288,6 +1954,7 @@ def refresh_dashboard_data():
                     seen_keys[key] = a
         deduped_alerts.extend(seen_keys.values())
         api_alerts = [{"type": a["type"], "region": a.get("region", ""), "text": a["text"], "risk_rising": a.get("risk_rising", True)} for a in deduped_alerts]
+
         _dashboard_state["scores"] = {
             "composite": composite_score,
             "risk_level": risk_level,
@@ -2312,7 +1979,6 @@ def refresh_dashboard_data():
         # --- Save ---
         try:
             save_score_snapshot(composite_score, pm_score, mkt_score, None, None, pm_stats, {}, {}, risk_level)
-            save_contract_snapshots(geo_markets)
             save_regional_scores(regional_composites, pm_regional, mkt_regional)
         except Exception as e: print(f"Save error: {e}")
 
@@ -2368,12 +2034,16 @@ def refresh_dashboard_data():
 
 @app.route("/health")
 def health():
+    if _time.time() - _dashboard_state["last_updated"] > 120:
+        ctx = app.app_context()
+        def bg():
+            with ctx: refresh_dashboard_data()
+        threading.Thread(target=bg).start()
     return "ok", 200
 
 
 @app.route("/api/scores")
 def api_scores():
-    """JSON endpoint for live score updates. Returns latest cached scores instantly."""
     import json as _json
     if _time.time() - _dashboard_state["last_updated"] > 120:
         ctx = app.app_context()
@@ -2425,11 +2095,7 @@ def dashboard():
 _threads_started = False
 
 def _keepalive_loop():
-    """Forces periodic data refreshes regardless of visitor traffic.
-    Replit aggressively sleeps published apps — UptimeRobot hitting /health
-    keeps the process alive but doesn't trigger data fetches. This loop
-    ensures refresh_dashboard_data() runs at least every 3 minutes."""
-    _time.sleep(60)  # Wait for initial startup and first thread stagger
+    _time.sleep(30)
     while True:
         try:
             if _time.time() - _dashboard_state["last_updated"] > 120:
@@ -2437,28 +2103,18 @@ def _keepalive_loop():
                     refresh_dashboard_data()
         except Exception as e:
             print(f"Keepalive refresh error: {e}")
-        _time.sleep(180)  # 3-minute cycle
+        _time.sleep(180)
 
 def start_background_threads():
     global _threads_started
     if _threads_started: return
     _threads_started = True
-    # Stagger thread launches to avoid OOM from simultaneous memory spikes
-    def _staggered_start():
-        _time.sleep(5)
-        threading.Thread(target=_cloudflare_background_loop, daemon=True).start()
-        print("Background thread started: Cloudflare Radar")
-        _time.sleep(30)
-        threading.Thread(target=_gdelt_background_loop, daemon=True).start()
-        print("Background thread started: GDELT BigQuery")
-        _time.sleep(30)
-        threading.Thread(target=_gtrends_background_loop, daemon=True).start()
-        print("Background thread started: Google Trends")
-        _time.sleep(10)
-        threading.Thread(target=_keepalive_loop, daemon=True).start()
-        print("Background thread started: Keepalive")
-    threading.Thread(target=_staggered_start, daemon=True).start()
-    print("Background threads starting (staggered)...")
+
+    threading.Thread(target=_gdelt_background_loop, daemon=True).start()
+    threading.Thread(target=_gtrends_background_loop, daemon=True).start()
+    threading.Thread(target=_cloudflare_background_loop, daemon=True).start()
+    threading.Thread(target=_keepalive_loop, daemon=True).start()
+    print("Background threads started: GDELT + Google Trends + Cloudflare Radar + Keepalive")
 
 start_background_threads()
 
